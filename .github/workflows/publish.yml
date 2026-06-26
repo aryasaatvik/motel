@@ -35,6 +35,9 @@ jobs:
       - name: Test
         run: bun run test
 
+      - name: Validate package
+        run: bun run release:validate
+
       # npm publish runs `prepublishOnly` (bun run web:build) automatically,
       # so we don't need an explicit build step.
       - name: Publish (OIDC, no token)
