@@ -101,9 +101,47 @@ export const buildLaunchAgentSpec = (options: { readonly home?: string; readonly
 }
 
 /** A custom runtime is an isolated daemon and must never control the global LaunchAgent. */
-export const usesLaunchAgentRuntime = (runtimeDirectory = process.env.MOTEL_RUNTIME_DIR): boolean => {
-	if (!runtimeDirectory?.trim()) return true
-	return path.resolve(runtimeDirectory) === path.resolve(buildLaunchAgentSpec().workingDirectory)
+export type LaunchAgentRuntimeOptions = {
+	readonly runtimeDirectory?: string
+	readonly databasePath?: string
+	readonly baseUrl?: string
+	readonly queryUrl?: string
+	readonly host?: string
+	readonly port?: number
+	readonly stateHome?: string
+	readonly environment?: NodeJS.ProcessEnv
+}
+
+const positivePort = (value: string | undefined, defaultValue: number) => {
+	const parsed = Number.parseInt(value ?? "", 10)
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue
+}
+
+const normalizedUrl = (value: string) => {
+	const url = new URL(value)
+	return `${url.protocol}//${url.host}`
+}
+
+/**
+ * Only the exact global daemon identity may control the global LaunchAgent.
+ * Any explicit state, database, URL, host, or port override is an isolated daemon.
+ */
+export const usesLaunchAgentRuntime = (options: LaunchAgentRuntimeOptions = {}): boolean => {
+	const environment = options.environment ?? process.env
+	const spec = buildLaunchAgentSpec()
+	const stateHome = options.stateHome ?? (environment.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state"))
+	const runtimeDirectory = options.runtimeDirectory ?? (environment.MOTEL_RUNTIME_DIR?.trim() || path.join(stateHome, "motel"))
+	const databasePath = options.databasePath ?? (environment.MOTEL_OTEL_DB_PATH?.trim() || path.join(runtimeDirectory, "telemetry.sqlite"))
+	const baseUrl = options.baseUrl ?? (environment.MOTEL_OTEL_BASE_URL?.trim() || options.queryUrl || environment.MOTEL_OTEL_QUERY_URL?.trim() || "http://127.0.0.1:27686")
+	const base = new URL(baseUrl)
+	const host = options.host ?? (environment.MOTEL_OTEL_HOST?.trim() || base.hostname)
+	const port = options.port ?? positivePort(environment.MOTEL_OTEL_PORT, positivePort(base.port, 80))
+	return path.resolve(runtimeDirectory) === path.resolve(spec.workingDirectory)
+		&& path.resolve(databasePath) === path.resolve(spec.environment.MOTEL_OTEL_DB_PATH)
+		&& normalizedUrl(baseUrl) === normalizedUrl(spec.environment.MOTEL_OTEL_BASE_URL)
+		&& normalizedUrl(options.queryUrl ?? (environment.MOTEL_OTEL_QUERY_URL?.trim() || baseUrl)) === normalizedUrl(spec.environment.MOTEL_OTEL_QUERY_URL)
+		&& host === spec.environment.MOTEL_OTEL_HOST
+		&& port === Number(spec.environment.MOTEL_OTEL_PORT)
 }
 
 export const renderLaunchAgentPlist = (spec: LaunchAgentSpec) => `<?xml version="1.0" encoding="UTF-8"?>
@@ -225,6 +263,17 @@ export type LaunchAgentStatus = {
 	readonly version: { readonly cli: string; readonly server: string | null; readonly drift: boolean | null }
 }
 
+const launchctlState = (result: CommandResult): LaunchAgentStatus["manager"] => {
+	if (result.exitCode === 0) return "loaded"
+	if (result.exitCode === 113 || /\bESRCH\b|Could not find service|No such process/i.test(`${result.stdout}\n${result.stderr}`)) return "not-loaded"
+	return "unknown"
+}
+
+const requireKnownLaunchctlState = (state: LaunchAgentStatus["manager"]) => {
+	if (state === "unknown") throw new LaunchAgentError("Unable to determine Motel LaunchAgent state from launchctl. Refusing to mutate the service until `motel service status` can inspect it reliably.")
+	return state
+}
+
 export type LaunchAgentManager = {
 	readonly available: boolean
 	readonly inspect: Effect.Effect<LaunchAgentInspection, LaunchAgentError>
@@ -252,7 +301,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 				installed: comparison.kind === "equivalent",
 				configuration: inspection.kind === "missing" ? "missing" : comparison.kind,
 				configurationDetails: comparison.kind === "divergent" ? comparison.fields : comparison.kind === "malformed" ? [comparison.message] : [],
-				manager: managerResult.exitCode === 0 ? "loaded" : "not-loaded",
+				manager: launchctlState(managerResult),
 				running: health.running,
 				health,
 				registryIdentity: health.registryPid === null ? "missing" : health.managed ? "verified" : "unverified",
@@ -271,10 +320,9 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			for (const executable of spec.programArguments.slice(0, 2)) {
 				if (!await operations.exists(executable)) throw new LaunchAgentError(`Cannot install Motel service: required executable is missing at ${executable}. Install Bun and Motel at the configured ~/.bun/bin paths first.`)
 			}
-			if (inspection.kind !== "missing") {
-				const managerResult = await optional(operations, "launchctl", ["print", spec.target])
-				if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
-			}
+			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (manager === "loaded" && !replace) throw new LaunchAgentError("Motel has a loaded LaunchAgent job that does not match the requested install state. Re-run with --replace to boot it out before installing.")
+			if (manager === "loaded") await required(operations, "launchctl", ["bootout", spec.target])
 			await operations.mkdir(spec.workingDirectory)
 			await writeAtomically(operations, spec)
 			await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
@@ -288,8 +336,8 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			if (compareLaunchAgent(inspection, spec).kind !== "equivalent") throw new LaunchAgentError("Cannot start an absent, malformed, or divergent Motel service.")
-			const printed = await optional(operations, "launchctl", ["print", spec.target])
-			if (printed.exitCode !== 0) await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
+			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (manager === "not-loaded") await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
 			return Effect.runPromise(status)
 		},
@@ -299,8 +347,8 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			if (compareLaunchAgent(inspection, spec).kind !== "equivalent") throw new LaunchAgentError("Cannot stop an absent, malformed, or divergent Motel service.")
-			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
-			if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
+			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (manager === "loaded") await required(operations, "launchctl", ["bootout", spec.target])
 			return Effect.runPromise(status)
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
@@ -309,8 +357,8 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			if (compareLaunchAgent(inspection, spec).kind !== "equivalent") throw new LaunchAgentError("Cannot restart an absent, malformed, or divergent Motel service.")
-			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
-			if (managerResult.exitCode !== 0) await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
+			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (manager === "not-loaded") await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
 			return Effect.runPromise(status)
 		},
@@ -319,13 +367,13 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 	const uninstall = Effect.tryPromise({
 		try: async () => {
 			const hasPlist = await operations.exists(spec.plistPath)
-			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
-			if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
+			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (manager === "loaded") await required(operations, "launchctl", ["bootout", spec.target])
 			if (hasPlist) {
 				await operations.unlink(spec.plistPath)
 				return { removed: true }
 			}
-			return { removed: managerResult.exitCode === 0 }
+			return { removed: manager === "loaded" }
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
@@ -354,16 +402,17 @@ export type MotelLifecycle = {
  * Routes the public daemon lifecycle before it reaches the detached manager.
  * A KeepAlive-managed launchd child is never directly signalled by Motel.
  */
-export const createMotelLifecycle = (options: { readonly service?: LaunchAgentManager; readonly daemon?: DaemonManager; readonly runtimeDirectory?: string } = {}): MotelLifecycle => {
+export const createMotelLifecycle = (options: { readonly service?: LaunchAgentManager; readonly daemon?: DaemonManager } & LaunchAgentRuntimeOptions = {}): MotelLifecycle => {
 	const service = options.service ?? createLaunchAgentManager()
 	const daemon = options.daemon ?? createDaemonManager()
-	const serviceEnabled = service.available && usesLaunchAgentRuntime(options.runtimeDirectory)
+	const serviceEnabled = service.available && usesLaunchAgentRuntime(options)
 	const route = (
 		status: LaunchAgentStatus,
 		supervised: Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
 		detached: Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
 	) => {
-		if (status.configuration === "missing" && status.manager !== "loaded") return detached
+		if (status.manager === "unknown") return Effect.fail(new LaunchAgentError("Unable to determine Motel LaunchAgent state. Refusing detached lifecycle routing until `motel service status` can inspect it reliably."))
+		if (status.configuration === "missing" && status.manager === "not-loaded") return detached
 		if (!status.installed) {
 			return Effect.fail(new LaunchAgentError(
 				status.manager === "loaded"
@@ -375,7 +424,10 @@ export const createMotelLifecycle = (options: { readonly service?: LaunchAgentMa
 	}
 	return {
 		status: serviceEnabled
-			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.configuration === "missing" && status.manager !== "loaded" ? daemon.getStatus : Effect.succeed(status))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => {
+				if (status.manager === "unknown") return Effect.fail(new LaunchAgentError("Unable to determine Motel LaunchAgent state. Refusing detached lifecycle routing until `motel service status` can inspect it reliably."))
+				return status.configuration === "missing" && status.manager === "not-loaded" ? daemon.getStatus : Effect.succeed(status)
+			})) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.getStatus,
 		start: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>

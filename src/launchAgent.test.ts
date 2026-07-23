@@ -45,7 +45,7 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
+const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	const calls: Array<readonly string[]> = []
@@ -62,7 +62,7 @@ const makeHarness = (options: { readonly installed?: boolean; readonly missingEx
 		run: async (command, args) => {
 			calls.push([command, ...args])
 			if (command === "plutil") return { exitCode: options.plutilExitCode ?? 0, stdout: JSON.stringify(plist), stderr: "invalid plist" }
-			if (command === "launchctl" && args[0] === "print") return { exitCode: options.launchctlPrintExitCode ?? 0, stdout: "", stderr: "" }
+			if (command === "launchctl" && args[0] === "print") return { exitCode: options.launchctlPrintExitCode ?? 113, stdout: "", stderr: options.launchctlPrintStderr ?? "Could not find service" }
 			if (command === "launchctl" && args[0] === "bootout") return { exitCode: options.bootoutExitCode ?? 0, stdout: "", stderr: "could not boot out" }
 			return { exitCode: 0, stdout: "", stderr: "" }
 		},
@@ -98,6 +98,7 @@ describe("LaunchAgent lifecycle", () => {
 		const installed = await Effect.runPromise(harness.manager.install(false))
 		expect(installed.installed).toBe(true)
 		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
+			["launchctl", "print", spec.target],
 			["launchctl", "bootstrap", spec.domain, spec.plistPath],
 			["launchctl", "enable", spec.target],
 			["launchctl", "kickstart", "-k", spec.target],
@@ -109,7 +110,7 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("refuses a divergent definition unless replace is explicit", async () => {
-		const harness = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" } })
+		const harness = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" }, launchctlPrintExitCode: 0 })
 		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow("ProcessType")
 		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([])
 		harness.calls.length = 0
@@ -132,7 +133,7 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("reports a plutil parse failure as a malformed configuration diagnostic", async () => {
-		const harness = makeHarness({ installed: true, plutilExitCode: 1, launchctlPrintExitCode: 1 })
+		const harness = makeHarness({ installed: true, plutilExitCode: 1, launchctlPrintExitCode: 113 })
 		const status = await Effect.runPromise(harness.manager.status)
 		expect(status.configuration).toBe("malformed")
 		expect(status.configurationDetails).toEqual(["invalid plist"])
@@ -140,7 +141,7 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("reports config, manager, health, registry, and version state without contaminating JSON", async () => {
-		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 1, health: daemonStatus({ managed: false, version: "0.2.5" }) })
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 113, health: daemonStatus({ managed: false, version: "0.2.5" }) })
 		const status = await Effect.runPromise(harness.manager.status)
 		expect(status).toMatchObject({
 			installed: true,
@@ -152,7 +153,7 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("uninstall only unloads and removes the plist", async () => {
-		const harness = makeHarness({ installed: true })
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 0 })
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: true })
 		expect(harness.calls).toEqual([
 			["launchctl", "print", spec.target],
@@ -161,23 +162,23 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("does not replace or remove a loaded job after bootout failure", async () => {
-		const replacement = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" }, bootoutExitCode: 1 })
+		const replacement = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" }, launchctlPrintExitCode: 0, bootoutExitCode: 1 })
 		await expect(Effect.runPromise(replacement.manager.install(true))).rejects.toThrow("could not boot out")
 		expect(replacement.fileEvents).toEqual([])
 
-		const removal = makeHarness({ installed: true, bootoutExitCode: 1 })
+		const removal = makeHarness({ installed: true, launchctlPrintExitCode: 0, bootoutExitCode: 1 })
 		await expect(Effect.runPromise(removal.manager.uninstall)).rejects.toThrow("could not boot out")
 		expect(removal.fileEvents).toEqual([])
 	})
 
 	test("keeps uninstall a no-op when neither plist nor job is present", async () => {
-		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 1 })
+		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 113 })
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: false })
 		expect(harness.fileEvents).toEqual([])
 	})
 
 	test("bootstraps an unloaded service before restarting it", async () => {
-		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 1 })
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 113 })
 		await Effect.runPromise(harness.manager.restart)
 		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
 			["launchctl", "print", spec.target],
@@ -188,12 +189,42 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("uninstalls a loaded orphan job even when its plist is already absent", async () => {
-		const harness = makeHarness({ installed: false })
+		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 0 })
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: true })
 		expect(harness.calls).toEqual([
 			["launchctl", "print", spec.target],
 			["launchctl", "bootout", spec.target],
 		])
+	})
+
+	test("requires replace and bootout before overwriting a loaded orphan job", async () => {
+		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 0 })
+		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow("--replace")
+		expect(harness.fileEvents).toEqual([])
+		harness.calls.length = 0
+		await Effect.runPromise(harness.manager.install(true))
+		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
+			["launchctl", "print", spec.target],
+			["launchctl", "bootout", spec.target],
+			["launchctl", "bootstrap", spec.domain, spec.plistPath],
+			["launchctl", "enable", spec.target],
+			["launchctl", "kickstart", "-k", spec.target],
+			["launchctl", "print", spec.target],
+		])
+	})
+
+	test("reports unknown launchctl inspection and refuses mutation", async () => {
+		const harness = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" }, launchctlPrintExitCode: 1, launchctlPrintStderr: "permission denied" })
+		expect((await Effect.runPromise(harness.manager.status)).manager).toBe("unknown")
+		await expect(Effect.runPromise(harness.manager.install(true))).rejects.toThrow("Unable to determine")
+		expect(harness.fileEvents).toEqual([])
+
+		const equivalent = makeHarness({ installed: true, launchctlPrintExitCode: 1, launchctlPrintStderr: "permission denied" })
+		await expect(Effect.runPromise(equivalent.manager.start)).rejects.toThrow("Unable to determine")
+		await expect(Effect.runPromise(equivalent.manager.stop)).rejects.toThrow("Unable to determine")
+		await expect(Effect.runPromise(equivalent.manager.restart)).rejects.toThrow("Unable to determine")
+		await expect(Effect.runPromise(equivalent.manager.uninstall)).rejects.toThrow("Unable to determine")
+		expect(equivalent.fileEvents).toEqual([])
 	})
 
 	test("fails service commands on non-macOS without attempting launchctl", async () => {
@@ -220,7 +251,7 @@ describe("LaunchAgent lifecycle", () => {
 	})
 })
 
-const fakeService = (input: { readonly installed: boolean; readonly configuration?: "missing" | "equivalent" | "divergent" | "malformed"; readonly manager?: "loaded" | "not-loaded" }, events: string[]): LaunchAgentManager => {
+const fakeService = (input: { readonly installed: boolean; readonly configuration?: "missing" | "equivalent" | "divergent" | "malformed"; readonly manager?: "loaded" | "not-loaded" | "unknown" }, events: string[]): LaunchAgentManager => {
 	const status = Effect.succeed({
 		installed: input.installed,
 		configuration: input.configuration ?? "equivalent",
@@ -276,6 +307,7 @@ describe("supervisor-aware top-level lifecycle", () => {
 		for (const serviceState of [
 			{ installed: false, configuration: "divergent" as const, manager: "not-loaded" as const },
 			{ installed: false, configuration: "missing" as const, manager: "loaded" as const },
+			{ installed: false, configuration: "missing" as const, manager: "unknown" as const },
 		]) {
 			const events: string[] = []
 			const daemon = {
@@ -305,7 +337,49 @@ describe("supervisor-aware top-level lifecycle", () => {
 		})
 		await Effect.runPromise(lifecycle.stop)
 		expect(events).toEqual(["daemon:stop"])
-		expect(usesLaunchAgentRuntime("/tmp/motel-release-isolation")).toBe(false)
+		expect(usesLaunchAgentRuntime({ runtimeDirectory: "/tmp/motel-release-isolation" })).toBe(false)
+	})
+
+	test("uses detached management for every non-global effective daemon identity", () => {
+		expect(usesLaunchAgentRuntime({ environment: {} })).toBe(true)
+		for (const options of [
+			{ stateHome: "/tmp/motel-xdg" },
+			{ runtimeDirectory: "/tmp/motel-runtime" },
+			{ databasePath: "/tmp/motel.sqlite" },
+			{ baseUrl: "http://127.0.0.1:27687" },
+			{ queryUrl: "http://127.0.0.1:27687" },
+			{ host: "0.0.0.0" },
+			{ port: 27687 },
+		]) expect(usesLaunchAgentRuntime({ environment: {}, ...options })).toBe(false)
+	})
+
+	test("never consults the global LaunchAgent for a non-global top-level lifecycle identity", async () => {
+		for (const options of [
+			{ stateHome: "/tmp/motel-xdg" },
+			{ databasePath: "/tmp/motel.sqlite" },
+			{ baseUrl: "http://127.0.0.1:27687" },
+			{ queryUrl: "http://127.0.0.1:27687" },
+			{ host: "0.0.0.0" },
+			{ port: 27687 },
+		]) {
+			const events: string[] = []
+			const daemon = {
+				applyEnv: Effect.void,
+				getStatus: Effect.succeed(daemonStatus()),
+				ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
+				stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
+			} satisfies DaemonManager
+			const original = fakeService({ installed: true }, events)
+			const service = {
+				...original,
+				status: Effect.sync(() => {
+					events.push("service:status")
+					return Effect.runSync(original.status)
+				}),
+			}
+			await Effect.runPromise(createMotelLifecycle({ service, daemon, environment: {}, ...options }).stop)
+			expect(events).toEqual(["daemon:stop"])
+		}
 	})
 
 	test("uses the detached manager on a non-macOS host without consulting launchctl", async () => {

@@ -55,12 +55,12 @@ test("startup lifecycle boots out only the matching loaded LaunchAgent child", a
 	expect(events).toEqual(["service:stop"])
 })
 
-test("startup lifecycle retains scoped detached recovery for a different conflict PID", async () => {
+test("startup lifecycle refuses detached recovery while another LaunchAgent child is loaded", async () => {
 	const events: string[] = []
 	const service = { available: true, status: Effect.succeed(serviceStatus(999)) } as unknown as LaunchAgentManager
 	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager
-	await stopConflictingDaemon(conflict, { service, createManager: () => manager })
-	expect(events).toEqual(["daemon:stop"])
+	await expect(stopConflictingDaemon(conflict, { service, createManager: () => manager })).rejects.toThrow("different process")
+	expect(events).toEqual([])
 })
 
 test("startup lifecycle fails closed when LaunchAgent ownership cannot be inspected", async () => {

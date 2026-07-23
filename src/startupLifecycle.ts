@@ -37,6 +37,12 @@ export const stopConflictingDaemon = async (
 			await Effect.runPromise(service.stop)
 			return
 		}
+		if (serviceStatus?.manager === "loaded") {
+			throw new Error("Refusing detached recovery while Motel LaunchAgent is loaded for a different process.")
+		}
+		if (serviceStatus?.manager === "unknown") {
+			throw new Error("Refusing detached recovery until Motel LaunchAgent ownership can be inspected reliably.")
+		}
 	}
 	const port = parsePort(status.url)
 	const manager = (options.createManager ?? createDaemonManager)({
