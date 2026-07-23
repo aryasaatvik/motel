@@ -41,6 +41,7 @@ export type CommandResult = {
 }
 
 export type LaunchAgentOperations = {
+	readonly platform: NodeJS.Platform
 	readonly exists: (file: string) => Promise<boolean>
 	readonly readFile: (file: string) => Promise<string>
 	readonly mkdir: (directory: string) => Promise<void>
@@ -175,6 +176,7 @@ const defaultOperations = (): LaunchAgentOperations => {
 		},
 		getDaemonStatus: () => Effect.runPromise(daemon.getStatus),
 		version: MOTEL_VERSION,
+		platform: process.platform,
 	}
 }
 
@@ -218,6 +220,7 @@ export type LaunchAgentStatus = {
 }
 
 export type LaunchAgentManager = {
+	readonly available: boolean
 	readonly inspect: Effect.Effect<LaunchAgentInspection, LaunchAgentError>
 	readonly status: Effect.Effect<LaunchAgentStatus, LaunchAgentError>
 	readonly install: (replace: boolean) => Effect.Effect<LaunchAgentStatus, LaunchAgentError>
@@ -229,6 +232,9 @@ export type LaunchAgentManager = {
 
 export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied?: Partial<LaunchAgentOperations>): LaunchAgentManager => {
 	const operations = { ...defaultOperations(), ...supplied }
+	const available = operations.platform === "darwin"
+	const macOnly = <A>(effect: Effect.Effect<A, LaunchAgentError>) =>
+		available ? effect : Effect.fail(new LaunchAgentError("Motel service management is available only on macOS LaunchAgent hosts."))
 	const inspect = Effect.tryPromise({ try: () => readInspection(operations, spec), catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)) })
 	const status = Effect.tryPromise({
 		try: async (): Promise<LaunchAgentStatus> => {
@@ -312,7 +318,16 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
-	return { inspect, status, install, uninstall, start, stop, restart }
+	return {
+		available,
+		inspect: macOnly(inspect),
+		status: macOnly(status),
+		install: (replace) => macOnly(install(replace)),
+		uninstall: macOnly(uninstall),
+		start: macOnly(start),
+		stop: macOnly(stop),
+		restart: macOnly(restart),
+	}
 }
 
 export const isInstalledLaunchAgent = (manager = createLaunchAgentManager()) => manager.status.pipe(Effect.map((status) => status.installed))
@@ -347,12 +362,23 @@ export const createMotelLifecycle = (options: { readonly service?: LaunchAgentMa
 		return supervised
 	}
 	return {
-		status: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.configuration === "missing" && status.manager !== "loaded" ? daemon.getStatus : Effect.succeed(status))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		start: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		stop: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.stop, daemon.stop))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		restart: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.restart, Effect.gen(function*() {
+		status: service.available
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.configuration === "missing" && status.manager !== "loaded" ? daemon.getStatus : Effect.succeed(status))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			: daemon.getStatus,
+		start: service.available
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			: daemon.ensure,
+		stop: service.available
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.stop, daemon.stop))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			: daemon.stop,
+		restart: service.available
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.restart, Effect.gen(function*() {
 			yield* daemon.stop
 			return yield* daemon.ensure
-		})))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		})))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			: Effect.gen(function*() {
+				yield* daemon.stop
+				return yield* daemon.ensure
+			}),
 	}
 }

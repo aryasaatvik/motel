@@ -50,6 +50,7 @@ const makeHarness = (options: { readonly installed?: boolean; readonly plist?: R
 	const calls: Array<readonly string[]> = []
 	const files = new Map<string, string>()
 	const operations: LaunchAgentOperations = {
+		platform: "darwin",
 		exists: async (file) => file === spec.plistPath ? installed : files.has(file),
 		readFile: async (file) => files.get(file) ?? "",
 		mkdir: async () => {},
@@ -156,6 +157,29 @@ describe("LaunchAgent lifecycle", () => {
 			["launchctl", "bootout", spec.target],
 		])
 	})
+
+	test("fails service commands on non-macOS without attempting launchctl", async () => {
+		const harness = makeHarness()
+		const linuxManager = createLaunchAgentManager(spec, {
+			...({
+				platform: "linux",
+				exists: async () => false,
+				readFile: async () => "",
+				mkdir: async () => {},
+				writeFile: async () => {},
+				rename: async () => {},
+				unlink: async () => {},
+				run: async (command: string, args: readonly string[]) => {
+					harness.calls.push([command, ...args])
+					return { exitCode: 0, stdout: "", stderr: "" }
+				},
+				getDaemonStatus: async () => daemonStatus(),
+				version: "0.2.6",
+			} satisfies LaunchAgentOperations),
+		})
+		await expect(Effect.runPromise(linuxManager.status)).rejects.toThrow("only on macOS")
+		expect(harness.calls).toEqual([])
+	})
 })
 
 const fakeService = (input: { readonly installed: boolean; readonly configuration?: "missing" | "equivalent" | "divergent" | "malformed"; readonly manager?: "loaded" | "not-loaded" }, events: string[]): LaunchAgentManager => {
@@ -170,6 +194,7 @@ const fakeService = (input: { readonly installed: boolean; readonly configuratio
 		version: { cli: "0.2.6", server: "0.2.6", drift: false },
 	})
 	return {
+		available: true,
 		inspect: Effect.succeed({ kind: "missing" as const }),
 		status,
 		install: () => status,
@@ -225,5 +250,18 @@ describe("supervisor-aware top-level lifecycle", () => {
 			await expect(Effect.runPromise(lifecycle.stop)).rejects.toThrow("LaunchAgent")
 			expect(events).toEqual([])
 		}
+	})
+
+	test("uses the detached manager on a non-macOS host without consulting launchctl", async () => {
+		const events: string[] = []
+		const daemon = {
+			applyEnv: Effect.void,
+			getStatus: Effect.succeed(daemonStatus()),
+			ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
+			stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
+		} satisfies DaemonManager
+		const service = { ...fakeService({ installed: false, configuration: "missing", manager: "not-loaded" }, events), available: false }
+		await Effect.runPromise(createMotelLifecycle({ service, daemon }).restart)
+		expect(events).toEqual(["daemon:stop", "daemon:start"])
 	})
 })
