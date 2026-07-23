@@ -72,7 +72,9 @@ export const stopConflictingDaemon = async (
 ) => {
 	const service = options.service ?? createLaunchAgentManager()
 	if (usesLaunchAgentRuntime() && service.available) {
-		const serviceStatus = await Effect.runPromise(service.status).catch(() => null)
+		const serviceStatus = await Effect.runPromise(service.status).catch((error) => {
+			throw new Error(`Refusing detached recovery until Motel LaunchAgent ownership can be inspected: ${error instanceof Error ? error.message : String(error)}`)
+		})
 		if (serviceStatus?.manager === "loaded" && serviceStatus.health.pid === status.pid) {
 			await Effect.runPromise(service.stop)
 			return

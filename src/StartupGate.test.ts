@@ -62,3 +62,11 @@ test("StartupGate retains scoped detached recovery for a different conflict PID"
 	await stopConflictingDaemon(conflict, { service, createManager: () => manager })
 	expect(events).toEqual(["daemon:stop"])
 })
+
+test("StartupGate fails closed when LaunchAgent ownership cannot be inspected", async () => {
+	const events: string[] = []
+	const service = { available: true, status: Effect.fail(new Error("plist unavailable")) } as unknown as LaunchAgentManager
+	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager
+	await expect(stopConflictingDaemon(conflict, { service, createManager: () => manager })).rejects.toThrow("Refusing detached recovery")
+	expect(events).toEqual([])
+})
