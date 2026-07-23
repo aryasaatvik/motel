@@ -1,257 +1,192 @@
-import { Effect, References } from "effect"
+import { Console, Effect, Option, References } from "effect"
+import { Argument, Command } from "effect/unstable/cli"
 import { config } from "./config.js"
 import { otelServerInstructions } from "./instructions.js"
 import { attributeFiltersFromArgs, isAttributeFilterToken } from "./queryFilters.js"
 import { queryRuntime } from "./runtime.js"
 import { TelemetryStoreReadonly } from "./services/TelemetryStore.js"
 
-const [command, ...args] = process.argv.slice(2)
+const json = (value: unknown) => Console.log(JSON.stringify(value, null, 2))
 
-const runQuiet = <A, E, R extends TelemetryStoreReadonly | never>(effect: Effect.Effect<A, E, R>) =>
-	queryRuntime.runPromise(effect.pipe(Effect.provideService(References.MinimumLogLevel, "None")))
+const query = <A>(effect: Effect.Effect<A, unknown, TelemetryStoreReadonly>) =>
+	Effect.promise(() => queryRuntime.runPromise(effect.pipe(Effect.provideService(References.MinimumLogLevel, "None")))).pipe(
+		Effect.andThen(json),
+		Effect.ensuring(Effect.promise(() => queryRuntime.dispose())),
+	)
 
-try {
-	switch (command) {
-	case "services": {
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listServices))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
+const optional = (value: Option.Option<string>, fallback?: string) => Option.getOrElse(value, () => fallback)
 
-	case "traces": {
-		const service = args[0] ?? config.otel.serviceName
-		const limit = args[1] ? Number.parseInt(args[1], 10) : config.otel.traceFetchLimit
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listRecentTraces(service, { limit })))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
+const services = Command.make("services", {}, () =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listServices)),
+).pipe(Command.withDescription("List observed telemetry services"))
 
-	case "trace": {
-		const traceId = args[0]
-		if (!traceId) {
-			throw new Error("Usage: bun run cli trace <trace-id>")
-		}
+const traces = Command.make("traces", {
+	service: Argument.string("service").pipe(Argument.optional),
+	limit: Argument.integer("limit").pipe(Argument.optional),
+}, ({ service, limit }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) =>
+		store.listRecentTraces(optional(service, config.otel.serviceName)!, {
+			limit: Option.getOrElse(limit, () => config.otel.traceFetchLimit),
+		}),
+	)),
+).pipe(Command.withDescription("List recent traces"))
 
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.getTrace(traceId)))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
+const trace = Command.make("trace", {
+	traceId: Argument.string("trace-id"),
+}, ({ traceId }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.getTrace(traceId))),
+).pipe(Command.withDescription("Get one trace"))
 
-	case "span": {
-		const spanId = args[0]
-		if (!spanId) {
-			throw new Error("Usage: bun run cli span <span-id>")
-		}
+const span = Command.make("span", {
+	spanId: Argument.string("span-id"),
+}, ({ spanId }) =>
+	Effect.promise(() => fetch(`${config.otel.queryUrl}/api/spans/${encodeURIComponent(spanId)}`).then((response) => response.json())).pipe(
+		Effect.andThen(json),
+	),
+).pipe(Command.withDescription("Get one span"))
 
-		const result = await fetch(`${config.otel.queryUrl}/api/spans/${encodeURIComponent(spanId)}`).then((response) => response.json())
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
+const traceSpans = Command.make("trace-spans", {
+	traceId: Argument.string("trace-id"),
+}, ({ traceId }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listTraceSpans(traceId))),
+).pipe(Command.withDescription("List spans in one trace"))
 
-	case "trace-spans": {
-		const traceId = args[0]
-		if (!traceId) {
-			throw new Error("Usage: bun run cli trace-spans <trace-id>")
-		}
-
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listTraceSpans(traceId)))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "search-spans": {
-		const service = args[0] ?? config.otel.serviceName
-		const operation = args[1] && !isAttributeFilterToken(args[1]) && !args[1].startsWith("parent=") ? args[1] : undefined
-		const parentTokenIndex = args.findIndex((value, index) => index > 0 && value.startsWith("parent="))
-		const parentOperation = parentTokenIndex >= 0 ? args[parentTokenIndex]?.slice("parent=".length) : undefined
-		const attributeStartIndex = operation ? 2 : 1
-		const attributeFilters = attributeFiltersFromArgs(args.slice(attributeStartIndex))
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.searchSpans({
-					serviceName: service,
-					operation,
-					parentOperation,
-					attributeFilters,
-					limit: config.otel.logFetchLimit,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "search-traces": {
-		const service = args[0] ?? config.otel.serviceName
-		const operation = args[1] && !isAttributeFilterToken(args[1]) ? args[1] : undefined
-		const attributeFilters = attributeFiltersFromArgs(args.slice(operation ? 2 : 1))
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.searchTraces({
-					serviceName: service,
-					operation,
-					attributeFilters,
-					limit: config.otel.traceFetchLimit,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "trace-stats": {
-		const groupBy = args[0]
-		const agg = args[1]
-		const service = args[2] && !isAttributeFilterToken(args[2]) ? args[2] : undefined
-		const attributeFilters = attributeFiltersFromArgs(args.slice(service ? 3 : 2))
-		if (!groupBy || (agg !== "count" && agg !== "avg_duration" && agg !== "p95_duration" && agg !== "error_rate")) {
-			throw new Error("Usage: bun run cli trace-stats <groupBy> <count|avg_duration|p95_duration|error_rate> [service]")
-		}
-
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.traceStats({
-					groupBy,
-					agg,
-					serviceName: service,
-					attributeFilters,
-					limit: 20,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "instructions": {
-		console.log(otelServerInstructions())
-		break
-	}
-
-	case "logs": {
-		const service = args[0] ?? config.otel.serviceName
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listRecentLogs(service)))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "search-logs": {
-		const service = args[0] ?? config.otel.serviceName
-		const body = args[1] && !isAttributeFilterToken(args[1]) ? args[1] : undefined
-		const attributeFilters = attributeFiltersFromArgs(args.slice(body ? 2 : 1))
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.searchLogs({
-					serviceName: service,
-					body,
-					attributeFilters,
-					limit: config.otel.logFetchLimit,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "log-stats": {
-		const groupBy = args[0]
-		const service = args[1] && !isAttributeFilterToken(args[1]) ? args[1] : undefined
-		const attributeFilters = attributeFiltersFromArgs(args.slice(service ? 2 : 1))
-		if (!groupBy) {
-			throw new Error("Usage: bun run cli log-stats <groupBy> [service]")
-		}
-
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.logStats({
-					groupBy,
-					agg: "count",
-					serviceName: service,
-					attributeFilters,
-					limit: 20,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "trace-logs": {
-		const traceId = args[0]
-		if (!traceId) {
-			throw new Error("Usage: bun run cli trace-logs <trace-id>")
-		}
-
-		const result = await runQuiet(Effect.flatMap(TelemetryStoreReadonly, (query) => query.listTraceLogs(traceId)))
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "span-logs": {
-		const spanId = args[0]
-		if (!spanId) {
-			throw new Error("Usage: bun run cli span-logs <span-id>")
-		}
-
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.searchLogs({
-					spanId,
-					limit: config.otel.logFetchLimit,
-				}),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "facets": {
-		const type = args[0]
-		const field = args[1]
-		if ((type !== "traces" && type !== "logs") || !field) {
-			throw new Error("Usage: bun run cli facets <traces|logs> <field>")
-		}
-
-		const result = await runQuiet(
-			Effect.flatMap(TelemetryStoreReadonly, (query) =>
-				query.listFacets({ type, field, limit: 20 }),
-			),
-		)
-		console.log(JSON.stringify(result, null, 2))
-		break
-	}
-
-	case "endpoints": {
-		console.log(JSON.stringify({
-			baseUrl: config.otel.baseUrl,
-			exporterUrl: config.otel.exporterUrl,
-			logsExporterUrl: config.otel.logsExporterUrl,
-			queryUrl: config.otel.queryUrl,
-			databasePath: config.otel.databasePath,
-		}, null, 2))
-		break
-	}
-
-	default: {
-		console.log(`Usage:
-	bun run cli services
-	bun run cli traces [service] [limit]
-	bun run cli trace <trace-id>
-	bun run cli span <span-id>
-	bun run cli trace-spans <trace-id>
-	bun run cli search-spans [service] [operation] [parent=<operation>] [attr.key=value ...]
-	bun run cli search-traces [service] [operation] [attr.key=value ...]
-	bun run cli trace-stats <groupBy> <agg> [service] [attr.key=value ...]
-	bun run cli logs [service]
-	bun run cli search-logs [service] [body] [attr.key=value ...]
-	bun run cli log-stats <groupBy> [service] [attr.key=value ...]
-	bun run cli trace-logs <trace-id>
-	bun run cli span-logs <span-id>
-	bun run cli facets <traces|logs> <field>
-	bun run cli instructions
-	bun run cli endpoints`)
-		}
-	}
-} finally {
-	await queryRuntime.dispose()
+const parseSearchSpans = (args: ReadonlyArray<string>) => {
+	const service = args[0] ?? config.otel.serviceName
+	const operation = args[1] && !isAttributeFilterToken(args[1]) && !args[1].startsWith("parent=") ? args[1] : undefined
+	const parentTokenIndex = args.findIndex((value, index) => index > 0 && value.startsWith("parent="))
+	const parentOperation = parentTokenIndex >= 0 ? args[parentTokenIndex]?.slice("parent=".length) : undefined
+	const attributeStartIndex = operation ? 2 : 1
+	return { service, operation, parentOperation, attributeFilters: attributeFiltersFromArgs(args.slice(attributeStartIndex)) }
 }
+
+const searchSpans = Command.make("search-spans", {
+	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+}, ({ args }) => {
+	const input = parseSearchSpans(args as ReadonlyArray<string>)
+	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchSpans({
+		serviceName: input.service,
+		operation: input.operation,
+		parentOperation: input.parentOperation,
+		attributeFilters: input.attributeFilters,
+		limit: config.otel.logFetchLimit,
+	})))
+}).pipe(Command.withDescription("Search spans by service, operation, parent, and attributes"))
+
+const searchTraces = Command.make("search-traces", {
+	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+}, ({ args }) => {
+	const values = args as ReadonlyArray<string>
+	const service = values[0] ?? config.otel.serviceName
+	const operation = values[1] && !isAttributeFilterToken(values[1]) ? values[1] : undefined
+	const attributeFilters = attributeFiltersFromArgs(values.slice(operation ? 2 : 1))
+	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchTraces({
+		serviceName: service,
+		operation,
+		attributeFilters,
+		limit: config.otel.traceFetchLimit,
+	})))
+}).pipe(Command.withDescription("Search trace summaries by service, operation, and attributes"))
+
+const traceStats = Command.make("trace-stats", {
+	groupBy: Argument.string("groupBy"),
+	agg: Argument.choice("aggregation", ["count", "avg_duration", "p95_duration", "error_rate"]),
+	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+}, ({ groupBy, agg, args }) => {
+	const values = args as ReadonlyArray<string>
+	const service = values[0] && !isAttributeFilterToken(values[0]) ? values[0] : undefined
+	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.traceStats({
+		groupBy,
+		agg,
+		serviceName: service,
+		attributeFilters: attributeFiltersFromArgs(values.slice(service ? 1 : 0)),
+		limit: 20,
+	})))
+}).pipe(Command.withDescription("Aggregate trace metrics"))
+
+const instructions = Command.make("instructions", {}, () => Console.log(otelServerInstructions()))
+	.pipe(Command.withDescription("Print Effect telemetry setup instructions"))
+
+const logs = Command.make("logs", {
+	service: Argument.string("service").pipe(Argument.optional),
+}, ({ service }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listRecentLogs(optional(service, config.otel.serviceName)!))),
+).pipe(Command.withDescription("List recent logs"))
+
+const searchLogs = Command.make("search-logs", {
+	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+}, ({ args }) => {
+	const values = args as ReadonlyArray<string>
+	const service = values[0] ?? config.otel.serviceName
+	const body = values[1] && !isAttributeFilterToken(values[1]) ? values[1] : undefined
+	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchLogs({
+		serviceName: service,
+		body,
+		attributeFilters: attributeFiltersFromArgs(values.slice(body ? 2 : 1)),
+		limit: config.otel.logFetchLimit,
+	})))
+}).pipe(Command.withDescription("Search logs by service, body, and attributes"))
+
+const logStats = Command.make("log-stats", {
+	groupBy: Argument.string("groupBy"),
+	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+}, ({ groupBy, args }) => {
+	const values = args as ReadonlyArray<string>
+	const service = values[0] && !isAttributeFilterToken(values[0]) ? values[0] : undefined
+	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.logStats({
+		groupBy,
+		agg: "count",
+		serviceName: service,
+		attributeFilters: attributeFiltersFromArgs(values.slice(service ? 1 : 0)),
+		limit: 20,
+	})))
+}).pipe(Command.withDescription("Aggregate log metrics"))
+
+const traceLogs = Command.make("trace-logs", {
+	traceId: Argument.string("trace-id"),
+}, ({ traceId }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listTraceLogs(traceId))),
+).pipe(Command.withDescription("List logs for one trace"))
+
+const spanLogs = Command.make("span-logs", {
+	spanId: Argument.string("span-id"),
+}, ({ spanId }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchLogs({
+		spanId,
+		limit: config.otel.logFetchLimit,
+	}))),
+).pipe(Command.withDescription("List logs for one span"))
+
+const facets = Command.make("facets", {
+	type: Argument.choice("type", ["traces", "logs"]),
+	field: Argument.string("field"),
+}, ({ type, field }) =>
+	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listFacets({ type, field, limit: 20 }))),
+).pipe(Command.withDescription("List facet values"))
+
+const endpoints = Command.make("endpoints", {}, () => json({
+	baseUrl: config.otel.baseUrl,
+	exporterUrl: config.otel.exporterUrl,
+	logsExporterUrl: config.otel.logsExporterUrl,
+	queryUrl: config.otel.queryUrl,
+	databasePath: config.otel.databasePath,
+})).pipe(Command.withDescription("Print configured telemetry endpoints"))
+
+export const queryCommands = [
+	services,
+	traces,
+	trace,
+	span,
+	traceSpans,
+	searchSpans,
+	searchTraces,
+	traceStats,
+	instructions,
+	logs,
+	searchLogs,
+	logStats,
+	traceLogs,
+	spanLogs,
+	facets,
+	endpoints,
+] as const
