@@ -44,29 +44,31 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly health?: DaemonStatus } = {}) => {
+const makeHarness = (options: { readonly installed?: boolean; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	const calls: Array<readonly string[]> = []
+	const fileEvents: string[] = []
 	const files = new Map<string, string>()
 	const operations: LaunchAgentOperations = {
 		platform: "darwin",
 		exists: async (file) => file === spec.plistPath ? installed : files.has(file),
 		readFile: async (file) => files.get(file) ?? "",
 		mkdir: async () => {},
-		writeFile: async (file, contents) => { files.set(file, contents) },
-		rename: async (_from, to) => { if (to === spec.plistPath) { installed = true; plist = plistValue() } },
-		unlink: async (file) => { if (file === spec.plistPath) installed = false; files.delete(file) },
+		writeFile: async (file, contents) => { fileEvents.push("write"); files.set(file, contents) },
+		rename: async (_from, to) => { fileEvents.push("rename"); if (to === spec.plistPath) { installed = true; plist = plistValue() } },
+		unlink: async (file) => { fileEvents.push("unlink"); if (file === spec.plistPath) installed = false; files.delete(file) },
 		run: async (command, args) => {
 			calls.push([command, ...args])
 			if (command === "plutil") return { exitCode: options.plutilExitCode ?? 0, stdout: JSON.stringify(plist), stderr: "invalid plist" }
 			if (command === "launchctl" && args[0] === "print") return { exitCode: options.launchctlPrintExitCode ?? 0, stdout: "", stderr: "" }
+			if (command === "launchctl" && args[0] === "bootout") return { exitCode: options.bootoutExitCode ?? 0, stdout: "", stderr: "could not boot out" }
 			return { exitCode: 0, stdout: "", stderr: "" }
 		},
 		getDaemonStatus: async () => options.health ?? daemonStatus(),
 		version: "0.2.6",
 	}
-	return { calls, manager: createLaunchAgentManager(spec, operations) }
+	return { calls, fileEvents, manager: createLaunchAgentManager(spec, operations) }
 }
 
 describe("LaunchAgent specification", () => {
@@ -112,7 +114,8 @@ describe("LaunchAgent lifecycle", () => {
 		harness.calls.length = 0
 		await Effect.runPromise(harness.manager.install(true))
 		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
-			["launchctl", "bootout", spec.domain, spec.plistPath],
+			["launchctl", "print", spec.target],
+			["launchctl", "bootout", spec.target],
 			["launchctl", "bootstrap", spec.domain, spec.plistPath],
 			["launchctl", "enable", spec.target],
 			["launchctl", "kickstart", "-k", spec.target],
@@ -145,8 +148,24 @@ describe("LaunchAgent lifecycle", () => {
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: true })
 		expect(harness.calls).toEqual([
 			["launchctl", "print", spec.target],
-			["launchctl", "bootout", spec.domain, spec.plistPath],
+			["launchctl", "bootout", spec.target],
 		])
+	})
+
+	test("does not replace or remove a loaded job after bootout failure", async () => {
+		const replacement = makeHarness({ installed: true, plist: { ...plistValue(), ProcessType: "Interactive" }, bootoutExitCode: 1 })
+		await expect(Effect.runPromise(replacement.manager.install(true))).rejects.toThrow("could not boot out")
+		expect(replacement.fileEvents).toEqual([])
+
+		const removal = makeHarness({ installed: true, bootoutExitCode: 1 })
+		await expect(Effect.runPromise(removal.manager.uninstall)).rejects.toThrow("could not boot out")
+		expect(removal.fileEvents).toEqual([])
+	})
+
+	test("keeps uninstall a no-op when neither plist nor job is present", async () => {
+		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 1 })
+		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: false })
+		expect(harness.fileEvents).toEqual([])
 	})
 
 	test("uninstalls a loaded orphan job even when its plist is already absent", async () => {

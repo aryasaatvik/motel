@@ -262,7 +262,10 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			if (comparison.kind === "equivalent") return Effect.runPromise(status)
 			if (comparison.kind === "malformed" && !replace) throw new LaunchAgentError(`Existing service plist is malformed: ${comparison.message}. Re-run with --replace to replace it.`)
 			if (comparison.kind === "divergent" && inspection.kind !== "missing" && !replace) throw new LaunchAgentError(`Existing service plist diverges in ${comparison.fields.join(", ")}. Re-run with --replace to replace it.`)
-			if (inspection.kind !== "missing") await optional(operations, "launchctl", ["bootout", spec.domain, spec.plistPath])
+			if (inspection.kind !== "missing") {
+				const managerResult = await optional(operations, "launchctl", ["print", spec.target])
+				if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
+			}
 			await operations.mkdir(spec.workingDirectory)
 			await writeAtomically(operations, spec)
 			await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
@@ -287,7 +290,8 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			if (compareLaunchAgent(inspection, spec).kind !== "equivalent") throw new LaunchAgentError("Cannot stop an absent, malformed, or divergent Motel service.")
-			await optional(operations, "launchctl", ["bootout", spec.domain, spec.plistPath])
+			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
+			if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
 			return Effect.runPromise(status)
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
@@ -305,16 +309,12 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const hasPlist = await operations.exists(spec.plistPath)
 			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
+			if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
 			if (hasPlist) {
-				await optional(operations, "launchctl", ["bootout", spec.domain, spec.plistPath])
 				await operations.unlink(spec.plistPath)
 				return { removed: true }
 			}
-			if (managerResult.exitCode === 0) {
-				await optional(operations, "launchctl", ["bootout", spec.target])
-				return { removed: true }
-			}
-			return { removed: false }
+			return { removed: managerResult.exitCode === 0 }
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
