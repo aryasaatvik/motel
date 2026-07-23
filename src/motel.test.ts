@@ -40,6 +40,12 @@ describe("motel command tree", () => {
 		expect(leaf.exitCode).toBe(0)
 		expect(leaf.stdout).toContain("motel trace-stats")
 		expect(leaf.stderr).toBe("")
+
+		const service = await motel("service", "install", "--help")
+		expect(service.exitCode).toBe(0)
+		expect(service.stdout).toContain("motel service install")
+		expect(service.stdout).toContain("--replace")
+		expect(service.stderr).toBe("")
 	})
 
 	test("keeps both version aliases to the bare package version", async () => {
