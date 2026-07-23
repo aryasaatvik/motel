@@ -1,96 +1,72 @@
 #!/usr/bin/env bun
 
-import { Effect } from "effect"
+import { BunRuntime, BunServices } from "@effect/platform-bun"
+import { Console, Effect } from "effect"
+import { CliOutput, Command } from "effect/unstable/cli"
+import packageJson from "../package.json" with { type: "json" }
+import { queryCommands } from "./cli.js"
 import { applyManagedDaemonEnv, ensureManagedDaemon, getManagedDaemonStatus, stopManagedDaemon } from "./daemon.js"
 
-const [command, ...args] = process.argv.slice(2)
+const json = (value: unknown) => Console.log(JSON.stringify(value, null, 2))
 
-const run = <A>(effect: Effect.Effect<A, Error>) => Effect.runPromise(effect)
+const tui = Command.make("tui", {}, () =>
+	Effect.gen(function*() {
+		yield* applyManagedDaemonEnv
+		yield* Effect.promise(() => import("./index.js"))
+	}),
+).pipe(Command.withDescription("Launch the telemetry TUI"))
 
-switch (command) {
-case undefined:
-case "tui":
-case "ui": {
-	await run(applyManagedDaemonEnv)
-	await import("./index.js")
-	break
-}
+const daemon = Command.make("daemon", {}, () =>
+	ensureManagedDaemon.pipe(Effect.andThen(json)),
+).pipe(
+	Command.withAlias("start"),
+	Command.withDescription("Ensure the managed telemetry daemon is running"),
+)
 
-case "daemon":
-case "start": {
-	const status = await run(ensureManagedDaemon)
-	console.log(JSON.stringify(status, null, 2))
-	break
-}
+const status = Command.make("status", {}, () =>
+	getManagedDaemonStatus.pipe(Effect.andThen(json)),
+).pipe(Command.withDescription("Print managed daemon status"))
 
-case "status": {
-	const status = await run(getManagedDaemonStatus)
-	console.log(JSON.stringify(status, null, 2))
-	break
-}
+const stop = Command.make("stop", {}, () =>
+	stopManagedDaemon.pipe(Effect.andThen(json)),
+).pipe(Command.withDescription("Stop the managed telemetry daemon"))
 
-case "stop": {
-	const status = await run(stopManagedDaemon)
-	console.log(JSON.stringify(status, null, 2))
-	break
-}
+const restart = Command.make("restart", {}, () =>
+	Effect.gen(function*() {
+		yield* stopManagedDaemon
+		yield* ensureManagedDaemon.pipe(Effect.andThen(json))
+	}),
+).pipe(Command.withDescription("Restart only the managed telemetry daemon"))
 
-case "restart": {
-	// Stop any running managed daemon, then start a fresh one + launch the
-	// TUI. Handy during local development when you've rebuilt the server
-	// and want the TUI to reconnect to the new binary in one command.
-	await run(stopManagedDaemon)
-	await run(applyManagedDaemonEnv)
-	await import("./index.js")
-	break
-}
+const server = Command.make("server", {}, () =>
+	Effect.gen(function*() {
+		yield* applyManagedDaemonEnv
+		yield* Effect.promise(() => import("./server.js"))
+	}),
+).pipe(Command.withDescription("Run the telemetry server in the foreground"))
 
-case "server": {
-	await run(applyManagedDaemonEnv)
-	await import("./server.js")
-	break
-}
+const mcp = Command.make("mcp", {}, () =>
+	Effect.promise(() => import("./mcp.js")),
+).pipe(Command.withDescription("Run the Motel MCP server over stdio"))
 
-case "mcp": {
-	await import("./mcp.js")
-	break
-}
+const motel = Command.make("motel", {}, () =>
+	Effect.gen(function*() {
+		yield* applyManagedDaemonEnv
+		yield* Effect.promise(() => import("./index.js"))
+	}),
+).pipe(
+	Command.withDescription("Local OpenTelemetry ingest and inspection"),
+	Command.withSubcommands([tui, daemon, status, stop, restart, server, mcp, ...queryCommands]),
+)
 
-case "help":
-case "--help":
-case "-h": {
-	console.log(`Usage:
-	motel
-	motel tui
-	motel daemon
-	motel status
-	motel stop
-	motel restart
-	motel server
-	motel mcp
-	motel services
-	motel traces [service] [limit]
-	motel trace <trace-id>
-	motel span <span-id>
-	motel trace-spans <trace-id>
-	motel search-spans [service] [operation] [parent=<operation>] [attr.key=value ...]
-	motel search-traces [service] [operation] [attr.key=value ...]
-	motel trace-stats <groupBy> <agg> [service] [attr.key=value ...]
-	motel logs [service]
-	motel search-logs [service] [body] [attr.key=value ...]
-	motel log-stats <groupBy> [service] [attr.key=value ...]
-	motel trace-logs <trace-id>
-	motel span-logs <span-id>
-	motel facets <traces|logs> <field>
-	motel instructions
-	motel endpoints`)
-	break
-}
+const defaultFormatter = CliOutput.defaultFormatter()
+const output = CliOutput.layer({
+	...defaultFormatter,
+	formatVersion: (_, version) => version,
+})
 
-default: {
-	await run(applyManagedDaemonEnv)
-	process.argv = [process.argv[0]!, process.argv[1]!, command, ...args]
-	await import("./cli.js")
-	break
-}
-}
+Command.run(motel, { version: packageJson.version }).pipe(
+	Effect.provide(BunServices.layer),
+	Effect.provide(output),
+	BunRuntime.runMain,
+)

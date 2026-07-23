@@ -8,22 +8,22 @@
 - Start the background daemon only: `bun run daemon` (same as `motel start`)
 - Stop the managed daemon: `bun run stop`
 - Daemon status JSON: `bun run status`
-- Restart daemon + relaunch TUI: `bun run restart`
+- Restart the managed daemon only: `bun run restart`
 - Run the local server in the foreground (no daemon, no TUI): `bun run server`
 - Run tests: `bun run test`
-- Query services via CLI: `bun run cli services`
-- Query traces via CLI: `bun run cli traces <service> [limit]`
-- Query a span via CLI: `bun run cli span <span-id>`
-- Query spans for one trace: `bun run cli trace-spans <trace-id>`
-- Search spans via CLI: `bun run cli search-spans [service] [operation] [parent=<operation>] [attr.key=value ...]`
-- Search traces via CLI: `bun run cli search-traces <service> [operation] [attr.key=value ...]`
-- Query trace stats via CLI: `bun run cli trace-stats <groupBy> <agg> [service] [attr.key=value ...]`
-- Query logs via CLI: `bun run cli logs <service>`
-- Search logs via CLI: `bun run cli search-logs <service> [body] [attr.key=value ...]`
-- Query log stats via CLI: `bun run cli log-stats <groupBy> [service] [attr.key=value ...]`
-- Query logs for one trace: `bun run cli trace-logs <trace-id>`
-- Query logs for one span: `bun run cli span-logs <span-id>`
-- Query facets via CLI: `bun run cli facets <traces|logs> <field>`
+- Query services via CLI: `motel services`
+- Query traces via CLI: `motel traces <service> [limit]`
+- Query a span via CLI: `motel span <span-id>`
+- Query spans for one trace: `motel trace-spans <trace-id>`
+- Search spans via CLI: `motel search-spans [service] [operation] [parent=<operation>] [attr.key=value ...]`
+- Search traces via CLI: `motel search-traces [service] [operation] [attr.key=value ...]`
+- Query trace stats via CLI: `motel trace-stats <groupBy> <agg> [service] [attr.key=value ...]`
+- Query logs via CLI: `motel logs <service>`
+- Search logs via CLI: `motel search-logs [service] [body] [attr.key=value ...]`
+- Query log stats via CLI: `motel log-stats <groupBy> [service] [attr.key=value ...]`
+- Query logs for one trace: `motel trace-logs <trace-id>`
+- Query logs for one span: `motel span-logs <span-id>`
+- Query facets via CLI: `motel facets <traces|logs> <field>`
 - Print Effect setup instructions: `bun run instructions`
 - Build the web UI: `bun run web:build`
 - Dev the web UI (with hot reload): `bun run web:dev`
@@ -47,7 +47,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 
 ## Verification
 - The built-in verification step is `bun run typecheck`.
-- For runtime verification, start the TUI or server once, then query `http://127.0.0.1:27686/api/services`, `http://127.0.0.1:27686/api/spans/<span-id>`, `http://127.0.0.1:27686/openapi.json`, and `bun run cli logs motel-otel-tui`.
+- For runtime verification, start the TUI or server once, then query `http://127.0.0.1:27686/api/services`, `http://127.0.0.1:27686/api/spans/<span-id>`, `http://127.0.0.1:27686/openapi.json`, and `motel logs motel-otel-tui`.
 - For span-centric debugging, use `http://127.0.0.1:27686/api/spans/search?...`, `http://127.0.0.1:27686/api/spans/<span-id>/logs`, and `http://127.0.0.1:27686/api/traces/<trace-id>/spans`.
 
 ## API Notes
@@ -89,7 +89,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
   `src/ui/SpanDetail.tsx` below a header that owns the span identity.
 - `src/ui/useKeyboardNav.ts` centralises the keyboard handlers and
   cross-pane navigation state transitions.
-- `src/cli.ts` exposes trace and log queries through a small local CLI wrapper.
+- `src/motel.ts` composes and runs the public Effect command tree; `src/cli.ts` exports typed telemetry query leaves and handlers.
 - `src/runtime.ts` wires the Effect beta runtime and OTEL trace + log exporters.
 - `src/localServer.ts` starts the local Bun OTLP/query server.
 - `src/httpApi.ts` defines the typed Effect HttpApi surface and OpenAPI spec for the local server.
