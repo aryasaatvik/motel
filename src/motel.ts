@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { BunRuntime, BunServices } from "@effect/platform-bun"
-import { Console, Effect } from "effect"
+import { Console, Effect, Layer } from "effect"
 import { CliOutput, Command } from "effect/unstable/cli"
 import packageJson from "../package.json" with { type: "json" }
 import { queryCommands } from "./cli.js"
@@ -66,7 +66,6 @@ const output = CliOutput.layer({
 })
 
 Command.run(motel, { version: packageJson.version }).pipe(
-	Effect.provide(BunServices.layer),
-	Effect.provide(output),
+	Effect.provide(Layer.mergeAll(BunServices.layer, output)),
 	BunRuntime.runMain,
 )
