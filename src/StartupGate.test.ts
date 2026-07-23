@@ -30,11 +30,11 @@ const conflict = {
 	registryPid: 321,
 }
 
-const serviceStatus = (pid: number): LaunchAgentStatus => ({
-	installed: true,
-	configuration: "equivalent",
+const serviceStatus = (pid: number, options: { readonly configuration?: LaunchAgentStatus["configuration"]; readonly manager?: LaunchAgentStatus["manager"] } = {}): LaunchAgentStatus => ({
+	installed: options.configuration === undefined || options.configuration === "equivalent",
+	configuration: options.configuration ?? "equivalent",
 	configurationDetails: [],
-	manager: "loaded",
+	manager: options.manager ?? "loaded",
 	running: true,
 	health: { ...conflict, pid } as DaemonStatus,
 	registryIdentity: "verified",
@@ -60,6 +60,14 @@ test("startup lifecycle refuses detached recovery while another LaunchAgent chil
 	const service = { available: true, status: Effect.succeed(serviceStatus(999)) } as unknown as LaunchAgentManager
 	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager
 	await expect(stopConflictingDaemon(conflict, { service, createManager: () => manager })).rejects.toThrow("different process")
+	expect(events).toEqual([])
+})
+
+test("startup lifecycle refuses detached recovery while a LaunchAgent definition remains present", async () => {
+	const events: string[] = []
+	const service = { available: true, status: Effect.succeed(serviceStatus(999, { manager: "not-loaded" })) } as unknown as LaunchAgentManager
+	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager
+	await expect(stopConflictingDaemon(conflict, { service, createManager: () => manager })).rejects.toThrow("definition is present")
 	expect(events).toEqual([])
 })
 

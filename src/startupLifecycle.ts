@@ -43,6 +43,9 @@ export const stopConflictingDaemon = async (
 		if (serviceStatus?.manager === "unknown") {
 			throw new Error("Refusing detached recovery until Motel LaunchAgent ownership can be inspected reliably.")
 		}
+		if (serviceStatus?.configuration !== "missing") {
+			throw new Error("Refusing detached recovery while a Motel LaunchAgent definition is present.")
+		}
 	}
 	const port = parsePort(status.url)
 	const manager = (options.createManager ?? createDaemonManager)({
