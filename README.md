@@ -14,29 +14,29 @@ agent session in the project will know how to use it.
 
 ```bash
 # Project-local (adds to .claude/skills, .agents/skills, etc.)
-npx skills add kitlangton/motel --skill motel-debug
+npx skills add aryasaatvik/motel --skill motel-debug
 
 # Or globally, for every project
-npx skills add kitlangton/motel --skill motel-debug -g
+npx skills add aryasaatvik/motel --skill motel-debug -g
 ```
 
 See the full skill at [`skills/motel-debug/SKILL.md`](skills/motel-debug/SKILL.md).
 
 ## For humans: install and run the TUI
 
-motel is distributed on npm as `@kitlangton/motel`. The binary is a Bun
+motel is distributed on npm as `@aryasaatvik/motel`. The binary is a Bun
 script, so Bun must be on your `PATH` at runtime:
 
 ```bash
 # one-off (no install)
-bunx @kitlangton/motel
+bunx @aryasaatvik/motel
 
 # or install globally
-bun add -g @kitlangton/motel
+bun add -g @aryasaatvik/motel
 motel
 
 # npm also works (Bun still required to run it)
-npm install -g @kitlangton/motel
+npm install -g @aryasaatvik/motel
 ```
 
 Don't have Bun?

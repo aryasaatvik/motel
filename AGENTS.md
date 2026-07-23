@@ -32,15 +32,14 @@
 - Effect LSP interactive setup wizard: `bunx effect-language-service setup`
 
 ## Release Strategy
-- npm package: `@kitlangton/motel`
-- Current published npm `latest`: `0.2.4` (`npm view @kitlangton/motel dist-tags --json`)
+- npm package: `@aryasaatvik/motel`
+- The package is created by an attended first publish; GitHub Actions OIDC publishing is enabled only after that setup.
 - Tags are versioned as `vX.Y.Z` (`git tag --sort=-version:refname` shows `v0.2.4`, `v0.2.3`, ...)
 - Publishing is handled by GitHub Actions in `.github/workflows/publish.yml`, not by local manual `npm publish`
-- The publish workflow triggers on `git push` of tags matching `v*` or via manual `workflow_dispatch`
-- The workflow runs `bun install --frozen-lockfile`, `bun run typecheck`, `bun run test`, then `npm publish --provenance`
-- `npm publish` runs `prepublishOnly`, which builds the web UI via `bun run web:build`
+- The publish workflow triggers only on `git push` of tags matching `v*`.
+- The workflow runs `bun install --frozen-lockfile`, `bun run typecheck`, `bun run test`, `bun run web:build`, and `bun run release:validate` before `npm publish --provenance`.
 - Before tagging a release, make sure the committed `package.json` version matches the intended git tag exactly
-- Preferred release flow: update `package.json` version, commit the release changes, create tag `v<package.json version>`, push the commit and tag, then verify the GitHub Actions publish and npm dist-tags
+- Preferred release flow: complete the attended first package creation and npm trusted-publisher setup, then update `package.json` version, commit the release changes, create tag `v<package.json version>`, push the commit and tag, then verify the GitHub Actions publish and npm dist-tags
 - Do not create or push release tags from a dirty worktree with unrelated uncommitted changes; ask before including unrelated edits in a release
 
 ## Effect LSP
