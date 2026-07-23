@@ -4,7 +4,7 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useMemo, useState } from "react"
 import { App } from "./App.js"
 import { createDaemonManager, getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
-import { createMotelLifecycle, type MotelLifecycle } from "./launchAgent.js"
+import { createLaunchAgentManager, createMotelLifecycle, usesLaunchAgentRuntime, type LaunchAgentManager, type MotelLifecycle } from "./launchAgent.js"
 import { MOTEL_SERVICE_ID } from "./registry.js"
 import { Divider, PlainLine, TextLine } from "./ui/primitives.tsx"
 import { colors } from "./ui/theme.ts"
@@ -63,9 +63,23 @@ const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictS
 	status.workdir !== null &&
 	status.reason !== null
 
-const stopConflictingDaemon = async (status: ConflictStatus) => {
+export const stopConflictingDaemon = async (
+	status: ConflictStatus,
+	options: {
+		readonly service?: LaunchAgentManager
+		readonly createManager?: typeof createDaemonManager
+	} = {},
+) => {
+	const service = options.service ?? createLaunchAgentManager()
+	if (usesLaunchAgentRuntime() && service.available) {
+		const serviceStatus = await Effect.runPromise(service.status).catch(() => null)
+		if (serviceStatus?.manager === "loaded" && serviceStatus.health.pid === status.pid) {
+			await Effect.runPromise(service.stop)
+			return
+		}
+	}
 	const port = parsePort(status.url)
-	const manager = createDaemonManager({
+	const manager = (options.createManager ?? createDaemonManager)({
 		workdir: status.workdir ?? undefined,
 		databasePath: status.databasePath,
 		port,
