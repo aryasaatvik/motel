@@ -100,6 +100,12 @@ export const buildLaunchAgentSpec = (options: { readonly home?: string; readonly
 	}
 }
 
+/** A custom runtime is an isolated daemon and must never control the global LaunchAgent. */
+export const usesLaunchAgentRuntime = (runtimeDirectory = process.env.MOTEL_RUNTIME_DIR): boolean => {
+	if (!runtimeDirectory?.trim()) return true
+	return path.resolve(runtimeDirectory) === path.resolve(buildLaunchAgentSpec().workingDirectory)
+}
+
 export const renderLaunchAgentPlist = (spec: LaunchAgentSpec) => `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -262,6 +268,9 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			if (comparison.kind === "equivalent") return Effect.runPromise(status)
 			if (comparison.kind === "malformed" && !replace) throw new LaunchAgentError(`Existing service plist is malformed: ${comparison.message}. Re-run with --replace to replace it.`)
 			if (comparison.kind === "divergent" && inspection.kind !== "missing" && !replace) throw new LaunchAgentError(`Existing service plist diverges in ${comparison.fields.join(", ")}. Re-run with --replace to replace it.`)
+			for (const executable of spec.programArguments.slice(0, 2)) {
+				if (!await operations.exists(executable)) throw new LaunchAgentError(`Cannot install Motel service: required executable is missing at ${executable}. Install Bun and Motel at the configured ~/.bun/bin paths first.`)
+			}
 			if (inspection.kind !== "missing") {
 				const managerResult = await optional(operations, "launchctl", ["print", spec.target])
 				if (managerResult.exitCode === 0) await required(operations, "launchctl", ["bootout", spec.target])
@@ -300,6 +309,8 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			if (compareLaunchAgent(inspection, spec).kind !== "equivalent") throw new LaunchAgentError("Cannot restart an absent, malformed, or divergent Motel service.")
+			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
+			if (managerResult.exitCode !== 0) await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
 			return Effect.runPromise(status)
 		},
@@ -343,9 +354,10 @@ export type MotelLifecycle = {
  * Routes the public daemon lifecycle before it reaches the detached manager.
  * A KeepAlive-managed launchd child is never directly signalled by Motel.
  */
-export const createMotelLifecycle = (options: { readonly service?: LaunchAgentManager; readonly daemon?: DaemonManager } = {}): MotelLifecycle => {
+export const createMotelLifecycle = (options: { readonly service?: LaunchAgentManager; readonly daemon?: DaemonManager; readonly runtimeDirectory?: string } = {}): MotelLifecycle => {
 	const service = options.service ?? createLaunchAgentManager()
 	const daemon = options.daemon ?? createDaemonManager()
+	const serviceEnabled = service.available && usesLaunchAgentRuntime(options.runtimeDirectory)
 	const route = (
 		status: LaunchAgentStatus,
 		supervised: Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
@@ -362,16 +374,16 @@ export const createMotelLifecycle = (options: { readonly service?: LaunchAgentMa
 		return supervised
 	}
 	return {
-		status: service.available
+		status: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.configuration === "missing" && status.manager !== "loaded" ? daemon.getStatus : Effect.succeed(status))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.getStatus,
-		start: service.available
+		start: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.ensure,
-		stop: service.available
+		stop: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.stop, daemon.stop))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.stop,
-		restart: service.available
+		restart: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.restart, Effect.gen(function*() {
 			yield* daemon.stop
 			return yield* daemon.ensure

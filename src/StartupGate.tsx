@@ -3,7 +3,8 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useMemo, useState } from "react"
 import { App } from "./App.js"
-import { createDaemonManager, ensureManagedDaemon, getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
+import { createDaemonManager, getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
+import { createMotelLifecycle, type MotelLifecycle } from "./launchAgent.js"
 import { MOTEL_SERVICE_ID } from "./registry.js"
 import { Divider, PlainLine, TextLine } from "./ui/primitives.tsx"
 import { colors } from "./ui/theme.ts"
@@ -44,7 +45,7 @@ type RecoveryAction = {
 }
 
 const readStatus = () => Effect.runPromise(getManagedDaemonStatus)
-const startDaemon = () => Effect.runPromise(ensureManagedDaemon)
+export const startDaemon = (lifecycle: MotelLifecycle = createMotelLifecycle()) => Effect.runPromise(lifecycle.start)
 
 const parsePort = (url: string) => {
 	try {

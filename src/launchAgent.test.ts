@@ -8,6 +8,7 @@ import {
 	createMotelLifecycle,
 	inspectLaunchAgentJson,
 	renderLaunchAgentPlist,
+	usesLaunchAgentRuntime,
 	type LaunchAgentManager,
 	type LaunchAgentOperations,
 } from "./launchAgent.js"
@@ -44,7 +45,7 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
+const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	const calls: Array<readonly string[]> = []
@@ -52,7 +53,7 @@ const makeHarness = (options: { readonly installed?: boolean; readonly plist?: R
 	const files = new Map<string, string>()
 	const operations: LaunchAgentOperations = {
 		platform: "darwin",
-		exists: async (file) => file === spec.plistPath ? installed : files.has(file),
+		exists: async (file) => file === spec.plistPath ? installed : !options.missingExecutables?.includes(file),
 		readFile: async (file) => files.get(file) ?? "",
 		mkdir: async () => {},
 		writeFile: async (file, contents) => { fileEvents.push("write"); files.set(file, contents) },
@@ -123,6 +124,13 @@ describe("LaunchAgent lifecycle", () => {
 		])
 	})
 
+	test("validates locked Bun and Motel executable paths before mutating the service", async () => {
+		const harness = makeHarness({ missingExecutables: [spec.programArguments[1]!] })
+		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow(spec.programArguments[1]!)
+		expect(harness.fileEvents).toEqual([])
+		expect(harness.calls).toEqual([])
+	})
+
 	test("reports a plutil parse failure as a malformed configuration diagnostic", async () => {
 		const harness = makeHarness({ installed: true, plutilExitCode: 1, launchctlPrintExitCode: 1 })
 		const status = await Effect.runPromise(harness.manager.status)
@@ -166,6 +174,17 @@ describe("LaunchAgent lifecycle", () => {
 		const harness = makeHarness({ installed: false, launchctlPrintExitCode: 1 })
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: false })
 		expect(harness.fileEvents).toEqual([])
+	})
+
+	test("bootstraps an unloaded service before restarting it", async () => {
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 1 })
+		await Effect.runPromise(harness.manager.restart)
+		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
+			["launchctl", "print", spec.target],
+			["launchctl", "bootstrap", spec.domain, spec.plistPath],
+			["launchctl", "kickstart", "-k", spec.target],
+			["launchctl", "print", spec.target],
+		])
 	})
 
 	test("uninstalls a loaded orphan job even when its plist is already absent", async () => {
@@ -269,6 +288,24 @@ describe("supervisor-aware top-level lifecycle", () => {
 			await expect(Effect.runPromise(lifecycle.stop)).rejects.toThrow("LaunchAgent")
 			expect(events).toEqual([])
 		}
+	})
+
+	test("uses detached management for an explicitly isolated runtime without consulting the LaunchAgent", async () => {
+		const events: string[] = []
+		const daemon = {
+			applyEnv: Effect.void,
+			getStatus: Effect.succeed(daemonStatus()),
+			ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
+			stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
+		} satisfies DaemonManager
+		const lifecycle = createMotelLifecycle({
+			service: fakeService({ installed: true }, events),
+			daemon,
+			runtimeDirectory: "/tmp/motel-release-isolation",
+		})
+		await Effect.runPromise(lifecycle.stop)
+		expect(events).toEqual(["daemon:stop"])
+		expect(usesLaunchAgentRuntime("/tmp/motel-release-isolation")).toBe(false)
 	})
 
 	test("uses the detached manager on a non-macOS host without consulting launchctl", async () => {
