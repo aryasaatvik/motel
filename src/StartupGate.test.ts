@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test"
 import { Effect } from "effect"
-import { startDaemon, stopConflictingDaemon } from "./StartupGate.js"
+import { startDaemon, stopConflictingDaemon } from "./startupLifecycle.js"
 import type { DaemonManager, DaemonStatus } from "./daemon.js"
 import type { LaunchAgentManager, LaunchAgentStatus, MotelLifecycle } from "./launchAgent.js"
 
-test("StartupGate starts through the supervisor-aware lifecycle", async () => {
+test("startup lifecycle starts through the supervisor-aware lifecycle", async () => {
 	const events: string[] = []
 	const lifecycle = {
 		start: Effect.sync(() => { events.push("lifecycle:start"); return {} }),
@@ -41,7 +41,7 @@ const serviceStatus = (pid: number): LaunchAgentStatus => ({
 	version: { cli: "0.2.6", server: "0.2.6", drift: false },
 })
 
-test("StartupGate boots out only the matching loaded LaunchAgent child", async () => {
+test("startup lifecycle boots out only the matching loaded LaunchAgent child", async () => {
 	const events: string[] = []
 	const service = {
 		available: true,
@@ -55,7 +55,7 @@ test("StartupGate boots out only the matching loaded LaunchAgent child", async (
 	expect(events).toEqual(["service:stop"])
 })
 
-test("StartupGate retains scoped detached recovery for a different conflict PID", async () => {
+test("startup lifecycle retains scoped detached recovery for a different conflict PID", async () => {
 	const events: string[] = []
 	const service = { available: true, status: Effect.succeed(serviceStatus(999)) } as unknown as LaunchAgentManager
 	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager
@@ -63,7 +63,7 @@ test("StartupGate retains scoped detached recovery for a different conflict PID"
 	expect(events).toEqual(["daemon:stop"])
 })
 
-test("StartupGate fails closed when LaunchAgent ownership cannot be inspected", async () => {
+test("startup lifecycle fails closed when LaunchAgent ownership cannot be inspected", async () => {
 	const events: string[] = []
 	const service = { available: true, status: Effect.fail(new Error("plist unavailable")) } as unknown as LaunchAgentManager
 	const manager = { stop: Effect.sync(() => { events.push("daemon:stop"); return {} }) } as unknown as DaemonManager

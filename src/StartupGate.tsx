@@ -3,18 +3,11 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useMemo, useState } from "react"
 import { App } from "./App.js"
-import { createDaemonManager, getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
-import { createLaunchAgentManager, createMotelLifecycle, usesLaunchAgentRuntime, type LaunchAgentManager, type MotelLifecycle } from "./launchAgent.js"
+import { getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
 import { MOTEL_SERVICE_ID } from "./registry.js"
+import { startDaemon, stopConflictingDaemon, type ConflictStatus } from "./startupLifecycle.js"
 import { Divider, PlainLine, TextLine } from "./ui/primitives.tsx"
 import { colors } from "./ui/theme.ts"
-
-type ConflictStatus = DaemonStatus & {
-	readonly service: typeof MOTEL_SERVICE_ID
-	readonly pid: number
-	readonly workdir: string
-	readonly reason: string
-}
 
 type ConflictScreenState = {
 	kind: "conflict"
@@ -45,16 +38,6 @@ type RecoveryAction = {
 }
 
 const readStatus = () => Effect.runPromise(getManagedDaemonStatus)
-export const startDaemon = (lifecycle: MotelLifecycle = createMotelLifecycle()) => Effect.runPromise(lifecycle.start)
-
-const parsePort = (url: string) => {
-	try {
-		const port = Number(new URL(url).port)
-		return Number.isFinite(port) && port > 0 ? port : undefined
-	} catch {
-		return undefined
-	}
-}
 
 const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictStatus =>
 	status !== null &&
@@ -62,32 +45,6 @@ const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictS
 	status.pid !== null &&
 	status.workdir !== null &&
 	status.reason !== null
-
-export const stopConflictingDaemon = async (
-	status: ConflictStatus,
-	options: {
-		readonly service?: LaunchAgentManager
-		readonly createManager?: typeof createDaemonManager
-	} = {},
-) => {
-	const service = options.service ?? createLaunchAgentManager()
-	if (usesLaunchAgentRuntime() && service.available) {
-		const serviceStatus = await Effect.runPromise(service.status).catch((error) => {
-			throw new Error(`Refusing detached recovery until Motel LaunchAgent ownership can be inspected: ${error instanceof Error ? error.message : String(error)}`)
-		})
-		if (serviceStatus?.manager === "loaded" && serviceStatus.health.pid === status.pid) {
-			await Effect.runPromise(service.stop)
-			return
-		}
-	}
-	const port = parsePort(status.url)
-	const manager = (options.createManager ?? createDaemonManager)({
-		workdir: status.workdir ?? undefined,
-		databasePath: status.databasePath,
-		port,
-	})
-	await Effect.runPromise(manager.stop)
-}
 
 const LoadingScreen = ({ width, height, message }: { width: number; height: number; message: string }) => {
 	const panelWidth = Math.min(76, Math.max(50, width - 8))
