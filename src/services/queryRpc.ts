@@ -9,7 +9,7 @@ export class QueryError extends Schema.TaggedErrorClass<QueryError>()("QueryErro
 export const QueryRpcs = RpcGroup.make(
 	Rpc.make("query", {
 		payload: { method: Schema.String, args: Schema.Array(Schema.Unknown) },
-		success: Schema.Unknown,
+		success: Schema.Any,
 		error: QueryError,
 	}),
 )
