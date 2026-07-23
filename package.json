@@ -1,5 +1,5 @@
 {
-  "name": "@kitlangton/motel",
+  "name": "@aryasaatvik/motel",
   "version": "0.2.6",
   "description": "A local OpenTelemetry ingest + TUI viewer for development, backed by SQLite.",
   "type": "module",
@@ -7,11 +7,11 @@
   "author": "Kit Langton",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kitlangton/motel.git"
+    "url": "git+https://github.com/aryasaatvik/motel.git"
   },
-  "homepage": "https://github.com/kitlangton/motel#readme",
+  "homepage": "https://github.com/aryasaatvik/motel#readme",
   "bugs": {
-    "url": "https://github.com/kitlangton/motel/issues"
+    "url": "https://github.com/aryasaatvik/motel/issues"
   },
   "keywords": [
     "opentelemetry",
@@ -30,7 +30,8 @@
     "bun": ">=1.3.0"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "overrides": {
     "@grpc/grpc-js": "1.14.4",

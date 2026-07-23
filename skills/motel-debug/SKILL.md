@@ -38,7 +38,7 @@ motel start
 `motel start` ensures the machine-global managed daemon is running, writes
 runtime files under `${XDG_STATE_HOME:-~/.local/state}/motel/`, and returns a
 JSON status blob. It is idempotent and shared across local projects. If motel isn't on `PATH`, fall
-back to `bunx @kitlangton/motel start`.
+back to `bunx @aryasaatvik/motel start`.
 
 After starting, re-check `GET /api/health` (may take 1–2s to become
 ready). If it still fails, read `${XDG_STATE_HOME:-~/.local/state}/motel/daemon.log` for the error
