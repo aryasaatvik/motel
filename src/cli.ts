@@ -16,6 +16,19 @@ const query = <A>(effect: Effect.Effect<A, unknown, TelemetryStoreReadonly>) =>
 
 const optional = (value: Option.Option<string>, fallback?: string) => Option.getOrElse(value, () => fallback)
 
+const searchOperand = Argument.string("service-or-filter").pipe(
+	Argument.mapTryCatch(
+		(value) => {
+			if (value.startsWith("attr.") && !isAttributeFilterToken(value)) {
+				throw new Error("attribute filters must use attr.<key>=<value>")
+			}
+			return value
+		},
+		(error) => error instanceof Error ? error.message : String(error),
+	),
+	Argument.variadic,
+)
+
 const services = Command.make("services", {}, () =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listServices)),
 ).pipe(Command.withDescription("List observed telemetry services"))
@@ -61,7 +74,7 @@ const parseSearchSpans = (args: ReadonlyArray<string>) => {
 }
 
 const searchSpans = Command.make("search-spans", {
-	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+	args: searchOperand,
 }, ({ args }) => {
 	const input = parseSearchSpans(args as ReadonlyArray<string>)
 	return query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchSpans({
@@ -74,7 +87,7 @@ const searchSpans = Command.make("search-spans", {
 }).pipe(Command.withDescription("Search spans by service, operation, parent, and attributes"))
 
 const searchTraces = Command.make("search-traces", {
-	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+	args: searchOperand,
 }, ({ args }) => {
 	const values = args as ReadonlyArray<string>
 	const service = values[0] ?? config.otel.serviceName
@@ -91,7 +104,7 @@ const searchTraces = Command.make("search-traces", {
 const traceStats = Command.make("trace-stats", {
 	groupBy: Argument.string("groupBy"),
 	agg: Argument.choice("aggregation", ["count", "avg_duration", "p95_duration", "error_rate"]),
-	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+	args: searchOperand,
 }, ({ groupBy, agg, args }) => {
 	const values = args as ReadonlyArray<string>
 	const service = values[0] && !isAttributeFilterToken(values[0]) ? values[0] : undefined
@@ -114,7 +127,7 @@ const logs = Command.make("logs", {
 ).pipe(Command.withDescription("List recent logs"))
 
 const searchLogs = Command.make("search-logs", {
-	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+	args: searchOperand,
 }, ({ args }) => {
 	const values = args as ReadonlyArray<string>
 	const service = values[0] ?? config.otel.serviceName
@@ -129,7 +142,7 @@ const searchLogs = Command.make("search-logs", {
 
 const logStats = Command.make("log-stats", {
 	groupBy: Argument.string("groupBy"),
-	args: Argument.string("service-or-filter").pipe(Argument.variadic),
+	args: searchOperand,
 }, ({ groupBy, args }) => {
 	const values = args as ReadonlyArray<string>
 	const service = values[0] && !isAttributeFilterToken(values[0]) ? values[0] : undefined
