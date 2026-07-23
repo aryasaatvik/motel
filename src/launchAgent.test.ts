@@ -44,7 +44,7 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly plist?: Record<string, unknown>; readonly launchctlPrintExitCode?: number; readonly health?: DaemonStatus } = {}) => {
+const makeHarness = (options: { readonly installed?: boolean; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly health?: DaemonStatus } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	const calls: Array<readonly string[]> = []
@@ -58,7 +58,7 @@ const makeHarness = (options: { readonly installed?: boolean; readonly plist?: R
 		unlink: async (file) => { if (file === spec.plistPath) installed = false; files.delete(file) },
 		run: async (command, args) => {
 			calls.push([command, ...args])
-			if (command === "plutil") return { exitCode: 0, stdout: JSON.stringify(plist), stderr: "" }
+			if (command === "plutil") return { exitCode: options.plutilExitCode ?? 0, stdout: JSON.stringify(plist), stderr: "invalid plist" }
 			if (command === "launchctl" && args[0] === "print") return { exitCode: options.launchctlPrintExitCode ?? 0, stdout: "", stderr: "" }
 			return { exitCode: 0, stdout: "", stderr: "" }
 		},
@@ -119,6 +119,14 @@ describe("LaunchAgent lifecycle", () => {
 		])
 	})
 
+	test("reports a plutil parse failure as a malformed configuration diagnostic", async () => {
+		const harness = makeHarness({ installed: true, plutilExitCode: 1, launchctlPrintExitCode: 1 })
+		const status = await Effect.runPromise(harness.manager.status)
+		expect(status.configuration).toBe("malformed")
+		expect(status.configurationDetails).toEqual(["invalid plist"])
+		expect(status.manager).toBe("not-loaded")
+	})
+
 	test("reports config, manager, health, registry, and version state without contaminating JSON", async () => {
 		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 1, health: daemonStatus({ managed: false, version: "0.2.5" }) })
 		const status = await Effect.runPromise(harness.manager.status)
@@ -134,16 +142,28 @@ describe("LaunchAgent lifecycle", () => {
 	test("uninstall only unloads and removes the plist", async () => {
 		const harness = makeHarness({ installed: true })
 		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: true })
-		expect(harness.calls).toEqual([["launchctl", "bootout", spec.domain, spec.plistPath]])
+		expect(harness.calls).toEqual([
+			["launchctl", "print", spec.target],
+			["launchctl", "bootout", spec.domain, spec.plistPath],
+		])
+	})
+
+	test("uninstalls a loaded orphan job even when its plist is already absent", async () => {
+		const harness = makeHarness({ installed: false })
+		expect(await Effect.runPromise(harness.manager.uninstall)).toEqual({ removed: true })
+		expect(harness.calls).toEqual([
+			["launchctl", "print", spec.target],
+			["launchctl", "bootout", spec.target],
+		])
 	})
 })
 
-const fakeService = (installed: boolean, events: string[]): LaunchAgentManager => {
+const fakeService = (input: { readonly installed: boolean; readonly configuration?: "missing" | "equivalent" | "divergent" | "malformed"; readonly manager?: "loaded" | "not-loaded" }, events: string[]): LaunchAgentManager => {
 	const status = Effect.succeed({
-		installed,
-		configuration: "equivalent" as const,
+		installed: input.installed,
+		configuration: input.configuration ?? "equivalent",
 		configurationDetails: [],
-		manager: "loaded" as const,
+		manager: input.manager ?? "loaded",
 		running: true,
 		health: daemonStatus(),
 		registryIdentity: "verified" as const,
@@ -169,7 +189,7 @@ describe("supervisor-aware top-level lifecycle", () => {
 			ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
 			stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
 		} satisfies DaemonManager
-		const lifecycle = createMotelLifecycle({ service: fakeService(true, events), daemon })
+		const lifecycle = createMotelLifecycle({ service: fakeService({ installed: true }, events), daemon })
 		await Effect.runPromise(lifecycle.start)
 		await Effect.runPromise(lifecycle.stop)
 		await Effect.runPromise(lifecycle.restart)
@@ -184,8 +204,26 @@ describe("supervisor-aware top-level lifecycle", () => {
 			ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
 			stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
 		} satisfies DaemonManager
-		const lifecycle = createMotelLifecycle({ service: fakeService(false, events), daemon })
+		const lifecycle = createMotelLifecycle({ service: fakeService({ installed: false, configuration: "missing", manager: "not-loaded" }, events), daemon })
 		await Effect.runPromise(lifecycle.restart)
 		expect(events).toEqual(["daemon:stop", "daemon:start"])
+	})
+
+	test("never falls through to PID control for divergent definitions or loaded orphan jobs", async () => {
+		for (const serviceState of [
+			{ installed: false, configuration: "divergent" as const, manager: "not-loaded" as const },
+			{ installed: false, configuration: "missing" as const, manager: "loaded" as const },
+		]) {
+			const events: string[] = []
+			const daemon = {
+				applyEnv: Effect.void,
+				getStatus: Effect.succeed(daemonStatus()),
+				ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
+				stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus() }),
+			} satisfies DaemonManager
+			const lifecycle = createMotelLifecycle({ service: fakeService(serviceState, events), daemon })
+			await expect(Effect.runPromise(lifecycle.stop)).rejects.toThrow("LaunchAgent")
+			expect(events).toEqual([])
+		}
 	})
 })

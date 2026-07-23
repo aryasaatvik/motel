@@ -188,7 +188,8 @@ const optional = async (operations: LaunchAgentOperations, command: string, args
 
 const readInspection = async (operations: LaunchAgentOperations, spec: LaunchAgentSpec): Promise<LaunchAgentInspection> => {
 	if (!await operations.exists(spec.plistPath)) return { kind: "missing" }
-	const result = await required(operations, "plutil", ["-convert", "json", "-o", "-", spec.plistPath])
+	const result = await optional(operations, "plutil", ["-convert", "json", "-o", "-", spec.plistPath])
+	if (result.exitCode !== 0) return { kind: "malformed", message: result.stderr.trim() || result.stdout.trim() || "plutil could not parse the plist." }
 	return inspectLaunchAgentJson(result.stdout)
 }
 
@@ -233,13 +234,13 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async (): Promise<LaunchAgentStatus> => {
 			const inspection = await readInspection(operations, spec)
 			const comparison = compareLaunchAgent(inspection, spec)
-			const managerResult = comparison.kind === "equivalent" ? await optional(operations, "launchctl", ["print", spec.target]) : null
+			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
 			const health = await operations.getDaemonStatus()
 			return {
 				installed: comparison.kind === "equivalent",
 				configuration: inspection.kind === "missing" ? "missing" : comparison.kind,
 				configurationDetails: comparison.kind === "divergent" ? comparison.fields : comparison.kind === "malformed" ? [comparison.message] : [],
-				manager: managerResult === null ? "unknown" : managerResult.exitCode === 0 ? "loaded" : "not-loaded",
+				manager: managerResult.exitCode === 0 ? "loaded" : "not-loaded",
 				running: health.running,
 				health,
 				registryIdentity: health.registryPid === null ? "missing" : health.managed ? "verified" : "unverified",
@@ -296,10 +297,18 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 	})
 	const uninstall = Effect.tryPromise({
 		try: async () => {
-			if (!await operations.exists(spec.plistPath)) return { removed: false }
-			await optional(operations, "launchctl", ["bootout", spec.domain, spec.plistPath])
-			await operations.unlink(spec.plistPath)
-			return { removed: true }
+			const hasPlist = await operations.exists(spec.plistPath)
+			const managerResult = await optional(operations, "launchctl", ["print", spec.target])
+			if (hasPlist) {
+				await optional(operations, "launchctl", ["bootout", spec.domain, spec.plistPath])
+				await operations.unlink(spec.plistPath)
+				return { removed: true }
+			}
+			if (managerResult.exitCode === 0) {
+				await optional(operations, "launchctl", ["bootout", spec.target])
+				return { removed: true }
+			}
+			return { removed: false }
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
@@ -322,13 +331,28 @@ export type MotelLifecycle = {
 export const createMotelLifecycle = (options: { readonly service?: LaunchAgentManager; readonly daemon?: DaemonManager } = {}): MotelLifecycle => {
 	const service = options.service ?? createLaunchAgentManager()
 	const daemon = options.daemon ?? createDaemonManager()
+	const route = (
+		status: LaunchAgentStatus,
+		supervised: Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		detached: Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+	) => {
+		if (status.configuration === "missing" && status.manager !== "loaded") return detached
+		if (!status.installed) {
+			return Effect.fail(new LaunchAgentError(
+				status.manager === "loaded"
+					? "Motel has a loaded LaunchAgent that does not match the expected service definition. Run `motel service uninstall` or repair it with `motel service install --replace`."
+					: "Motel has a present LaunchAgent definition that does not match the expected service contract. Inspect `motel service status` and use `motel service install --replace` if replacement is intended.",
+			))
+		}
+		return supervised
+	}
 	return {
-		status: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.installed ? Effect.succeed(status) : daemon.getStatus)) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		start: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.installed ? service.start : daemon.ensure)) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		stop: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.installed ? service.stop : daemon.stop)) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
-		restart: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.installed ? service.restart : Effect.gen(function*() {
+		status: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => status.configuration === "missing" && status.manager !== "loaded" ? daemon.getStatus : Effect.succeed(status))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		start: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		stop: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.stop, daemon.stop))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		restart: service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.restart, Effect.gen(function*() {
 			yield* daemon.stop
 			return yield* daemon.ensure
-		}))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
+		})))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>,
 	}
 }
