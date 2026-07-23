@@ -52,6 +52,26 @@ for any Effect/OTEL app you want to trace.
 
 Requirements: [Bun](https://bun.sh/) v1.1 or newer.
 
+### macOS service from the maintained checkout
+
+The per-user LaunchAgent intentionally runs
+`~/.bun/bin/bun ~/.bun/bin/motel server`. For a maintained-checkout
+installation, prepare and link the merged `dev` checkout before installing
+the service:
+
+```bash
+bun install --frozen-lockfile
+bun run web:build
+bun link
+motel service install
+```
+
+This service path does not discover npm-global or arbitrary `PATH`
+executables. `motel service install` verifies both stable Bun bin paths before
+writing or loading the LaunchAgent. Re-running it leaves an equivalent loaded
+service unchanged and loads an equivalent definition that is currently
+unloaded.
+
 ## How your app connects
 
 Once motel is running, point your app's OTLP/HTTP exporters at these

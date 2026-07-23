@@ -3,17 +3,11 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useMemo, useState } from "react"
 import { App } from "./App.js"
-import { createDaemonManager, ensureManagedDaemon, getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
+import { getManagedDaemonStatus, type DaemonStatus } from "./daemon.js"
 import { MOTEL_SERVICE_ID } from "./registry.js"
+import { startDaemon, stopConflictingDaemon, type ConflictStatus } from "./startupLifecycle.js"
 import { Divider, PlainLine, TextLine } from "./ui/primitives.tsx"
 import { colors } from "./ui/theme.ts"
-
-type ConflictStatus = DaemonStatus & {
-	readonly service: typeof MOTEL_SERVICE_ID
-	readonly pid: number
-	readonly workdir: string
-	readonly reason: string
-}
 
 type ConflictScreenState = {
 	kind: "conflict"
@@ -44,16 +38,6 @@ type RecoveryAction = {
 }
 
 const readStatus = () => Effect.runPromise(getManagedDaemonStatus)
-const startDaemon = () => Effect.runPromise(ensureManagedDaemon)
-
-const parsePort = (url: string) => {
-	try {
-		const port = Number(new URL(url).port)
-		return Number.isFinite(port) && port > 0 ? port : undefined
-	} catch {
-		return undefined
-	}
-}
 
 const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictStatus =>
 	status !== null &&
@@ -61,16 +45,6 @@ const isRecoverableConflict = (status: DaemonStatus | null): status is ConflictS
 	status.pid !== null &&
 	status.workdir !== null &&
 	status.reason !== null
-
-const stopConflictingDaemon = async (status: ConflictStatus) => {
-	const port = parsePort(status.url)
-	const manager = createDaemonManager({
-		workdir: status.workdir ?? undefined,
-		databasePath: status.databasePath,
-		port,
-	})
-	await Effect.runPromise(manager.stop)
-}
 
 const LoadingScreen = ({ width, height, message }: { width: number; height: number; message: string }) => {
 	const panelWidth = Math.min(76, Math.max(50, width - 8))

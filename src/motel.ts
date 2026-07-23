@@ -2,10 +2,11 @@
 
 import { BunRuntime, BunServices } from "@effect/platform-bun"
 import { Console, Effect, Layer } from "effect"
-import { CliOutput, Command } from "effect/unstable/cli"
+import { CliOutput, Command, Flag } from "effect/unstable/cli"
 import packageJson from "../package.json" with { type: "json" }
 import { queryCommands } from "./cli.js"
-import { applyManagedDaemonEnv, ensureManagedDaemon, getManagedDaemonStatus, stopManagedDaemon } from "./daemon.js"
+import { applyManagedDaemonEnv } from "./daemon.js"
+import { createLaunchAgentManager, createMotelLifecycle } from "./launchAgent.js"
 
 const json = (value: unknown) => Console.log(JSON.stringify(value, null, 2))
 
@@ -16,27 +17,43 @@ const tui = Command.make("tui", {}, () =>
 	}),
 ).pipe(Command.withDescription("Launch the telemetry TUI"))
 
+const lifecycle = createMotelLifecycle()
+
 const daemon = Command.make("daemon", {}, () =>
-	ensureManagedDaemon.pipe(Effect.andThen(json)),
+	lifecycle.start.pipe(Effect.andThen(json)),
 ).pipe(
 	Command.withAlias("start"),
 	Command.withDescription("Ensure the managed telemetry daemon is running"),
 )
 
 const status = Command.make("status", {}, () =>
-	getManagedDaemonStatus.pipe(Effect.andThen(json)),
+	lifecycle.status.pipe(Effect.andThen(json)),
 ).pipe(Command.withDescription("Print managed daemon status"))
 
 const stop = Command.make("stop", {}, () =>
-	stopManagedDaemon.pipe(Effect.andThen(json)),
+	lifecycle.stop.pipe(Effect.andThen(json)),
 ).pipe(Command.withDescription("Stop the managed telemetry daemon"))
 
 const restart = Command.make("restart", {}, () =>
-	Effect.gen(function*() {
-		yield* stopManagedDaemon
-		yield* ensureManagedDaemon.pipe(Effect.andThen(json))
-	}),
+	lifecycle.restart.pipe(Effect.andThen(json)),
 ).pipe(Command.withDescription("Restart only the managed telemetry daemon"))
+
+const serviceManager = createLaunchAgentManager()
+const serviceInstall = Command.make("install", { replace: Flag.boolean("replace") }, ({ replace }) =>
+	serviceManager.install(replace).pipe(Effect.andThen(json)),
+).pipe(Command.withDescription("Install the per-user Motel LaunchAgent"))
+const serviceStatus = Command.make("status", {}, () =>
+	serviceManager.status.pipe(Effect.andThen(json)),
+).pipe(Command.withDescription("Print per-user LaunchAgent and daemon status"))
+const serviceUninstall = Command.make("uninstall", {}, () =>
+	serviceManager.uninstall.pipe(Effect.andThen(json)),
+).pipe(Command.withDescription("Unload and remove the per-user Motel LaunchAgent definition"))
+const service = Command.make("service", {}, () =>
+	Effect.fail(new Error("Specify service install, service status, or service uninstall.")),
+).pipe(
+	Command.withDescription("Manage the per-user Motel LaunchAgent"),
+	Command.withSubcommands([serviceInstall, serviceStatus, serviceUninstall]),
+)
 
 const server = Command.make("server", {}, () =>
 	Effect.gen(function*() {
@@ -56,7 +73,7 @@ const motel = Command.make("motel", {}, () =>
 	}),
 ).pipe(
 	Command.withDescription("Local OpenTelemetry ingest and inspection"),
-	Command.withSubcommands([tui, daemon, status, stop, restart, server, mcp, ...queryCommands]),
+	Command.withSubcommands([tui, daemon, status, stop, restart, service, server, mcp, ...queryCommands]),
 )
 
 const defaultFormatter = CliOutput.defaultFormatter()

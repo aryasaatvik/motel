@@ -130,7 +130,9 @@ try {
 	const motel = path.join(prefixDir, "node_modules", ".bin", "motel")
 	const motelMcp = path.join(prefixDir, "node_modules", ".bin", "motel-mcp")
 	const help = await run([motel, "--help"], prefixDir)
-	if (!help.includes("motel daemon")) throw new Error("Packed motel binary did not print its help output")
+	if (!help.includes("motel <subcommand>") || !help.includes("daemon, start") || !help.includes("service")) {
+		throw new Error("Packed motel binary did not print the expected Effect CLI command tree")
+	}
 	const runtimeDir = path.join(temp, "runtime")
 	await mkdir(runtimeDir)
 	const runtimeEnv = {
