@@ -290,6 +290,15 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 	const available = operations.platform === "darwin"
 	const macOnly = <A>(effect: Effect.Effect<A, LaunchAgentError>) =>
 		available ? effect : Effect.fail(new LaunchAgentError("Motel service management is available only on macOS LaunchAgent hosts."))
+	const requireExecutables = async () => {
+		for (const executable of spec.programArguments.slice(0, 2)) {
+			if (!await operations.exists(executable)) {
+				throw new LaunchAgentError(
+					`Cannot install Motel service: required executable is missing at ${executable}. Install Bun at ~/.bun/bin/bun and run \`bun link\` from the maintained Motel checkout so ~/.bun/bin/motel exists.`,
+				)
+			}
+		}
+	}
 	const inspect = Effect.tryPromise({ try: () => readInspection(operations, spec), catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)) })
 	const status = Effect.tryPromise({
 		try: async (): Promise<LaunchAgentStatus> => {
@@ -314,13 +323,18 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 		try: async () => {
 			const inspection = await readInspection(operations, spec)
 			const comparison = compareLaunchAgent(inspection, spec)
-			if (comparison.kind === "equivalent") return Effect.runPromise(status)
 			if (comparison.kind === "malformed" && !replace) throw new LaunchAgentError(`Existing service plist is malformed: ${comparison.message}. Re-run with --replace to replace it.`)
 			if (comparison.kind === "divergent" && inspection.kind !== "missing" && !replace) throw new LaunchAgentError(`Existing service plist diverges in ${comparison.fields.join(", ")}. Re-run with --replace to replace it.`)
-			for (const executable of spec.programArguments.slice(0, 2)) {
-				if (!await operations.exists(executable)) throw new LaunchAgentError(`Cannot install Motel service: required executable is missing at ${executable}. Install Bun and Motel at the configured ~/.bun/bin paths first.`)
-			}
 			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
+			if (comparison.kind === "equivalent") {
+				if (manager === "loaded") return Effect.runPromise(status)
+				await requireExecutables()
+				await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
+				await required(operations, "launchctl", ["enable", spec.target])
+				await required(operations, "launchctl", ["kickstart", "-k", spec.target])
+				return Effect.runPromise(status)
+			}
+			await requireExecutables()
 			if (manager === "loaded" && !replace) throw new LaunchAgentError("Motel has a loaded LaunchAgent job that does not match the requested install state. Re-run with --replace to boot it out before installing.")
 			if (manager === "loaded") await required(operations, "launchctl", ["bootout", spec.target])
 			await operations.mkdir(spec.workingDirectory)

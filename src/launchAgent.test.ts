@@ -48,6 +48,7 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
+	let launchctlPrintExitCode = options.launchctlPrintExitCode ?? 113
 	const calls: Array<readonly string[]> = []
 	const fileEvents: string[] = []
 	const files = new Map<string, string>()
@@ -62,8 +63,13 @@ const makeHarness = (options: { readonly installed?: boolean; readonly missingEx
 		run: async (command, args) => {
 			calls.push([command, ...args])
 			if (command === "plutil") return { exitCode: options.plutilExitCode ?? 0, stdout: JSON.stringify(plist), stderr: "invalid plist" }
-			if (command === "launchctl" && args[0] === "print") return { exitCode: options.launchctlPrintExitCode ?? 113, stdout: "", stderr: options.launchctlPrintStderr ?? "Could not find service" }
-			if (command === "launchctl" && args[0] === "bootout") return { exitCode: options.bootoutExitCode ?? 0, stdout: "", stderr: "could not boot out" }
+			if (command === "launchctl" && args[0] === "print") return { exitCode: launchctlPrintExitCode, stdout: "", stderr: options.launchctlPrintStderr ?? (launchctlPrintExitCode === 113 ? "Could not find service" : "") }
+			if (command === "launchctl" && args[0] === "bootout") {
+				const exitCode = options.bootoutExitCode ?? 0
+				if (exitCode === 0) launchctlPrintExitCode = 113
+				return { exitCode, stdout: "", stderr: "could not boot out" }
+			}
+			if (command === "launchctl" && args[0] === "bootstrap") launchctlPrintExitCode = 0
 			return { exitCode: 0, stdout: "", stderr: "" }
 		},
 		getDaemonStatus: async () => options.health ?? daemonStatus(),
@@ -93,7 +99,7 @@ describe("LaunchAgent specification", () => {
 })
 
 describe("LaunchAgent lifecycle", () => {
-	test("installs atomically in launchctl-safe order and is a no-op when equivalent", async () => {
+	test("installs atomically and keeps an equivalent loaded service as a no-op", async () => {
 		const harness = makeHarness()
 		const installed = await Effect.runPromise(harness.manager.install(false))
 		expect(installed.installed).toBe(true)
@@ -107,6 +113,33 @@ describe("LaunchAgent lifecycle", () => {
 		harness.calls.length = 0
 		await Effect.runPromise(harness.manager.install(false))
 		expect(harness.calls.filter(([command, action]) => command === "launchctl" && action !== "print")).toEqual([])
+	})
+
+	test("reconciles an equivalent unloaded definition without rewriting it", async () => {
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 113 })
+		await Effect.runPromise(harness.manager.install(false))
+		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
+			["launchctl", "print", spec.target],
+			["launchctl", "bootstrap", spec.domain, spec.plistPath],
+			["launchctl", "enable", spec.target],
+			["launchctl", "kickstart", "-k", spec.target],
+			["launchctl", "print", spec.target],
+		])
+		expect(harness.fileEvents).toEqual([])
+	})
+
+	test("refuses to load an equivalent definition when the linked executable is missing", async () => {
+		const harness = makeHarness({
+			installed: true,
+			launchctlPrintExitCode: 113,
+			missingExecutables: [spec.programArguments[1]!],
+		})
+		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow("bun link")
+		expect(harness.calls).toEqual([
+			["plutil", "-convert", "json", "-o", "-", spec.plistPath],
+			["launchctl", "print", spec.target],
+		])
+		expect(harness.fileEvents).toEqual([])
 	})
 
 	test("refuses a divergent definition unless replace is explicit", async () => {
@@ -127,9 +160,9 @@ describe("LaunchAgent lifecycle", () => {
 
 	test("validates locked Bun and Motel executable paths before mutating the service", async () => {
 		const harness = makeHarness({ missingExecutables: [spec.programArguments[1]!] })
-		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow(spec.programArguments[1]!)
+		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow("bun link")
 		expect(harness.fileEvents).toEqual([])
-		expect(harness.calls).toEqual([])
+		expect(harness.calls).toEqual([["launchctl", "print", spec.target]])
 	})
 
 	test("reports a plutil parse failure as a malformed configuration diagnostic", async () => {
