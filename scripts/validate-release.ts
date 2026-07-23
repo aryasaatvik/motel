@@ -3,14 +3,28 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 
 type PackResult = {
+	readonly name: string
+	readonly version: string
 	readonly filename: string
 	readonly files: ReadonlyArray<{ readonly path: string }>
+}
+
+type PackageManifest = {
+	readonly name: string
+	readonly version: string
+	readonly repository: { readonly type: string; readonly url: string }
+	readonly homepage: string
+	readonly bugs: { readonly url: string }
+	readonly bin: Record<string, string>
+	readonly publishConfig: { readonly access: string; readonly registry: string }
 }
 
 const root = path.resolve(import.meta.dir, "..")
 const temp = await mkdtemp(path.join(tmpdir(), "motel-release-"))
 const packDir = path.join(temp, "pack")
-const consumerDir = path.join(temp, "consumer")
+const prefixDir = path.join(temp, "prefix")
+const packageName = "@aryasaatvik/motel"
+const repositoryUrl = "git+https://github.com/aryasaatvik/motel.git"
 
 const run = async (
 	cmd: ReadonlyArray<string>,
@@ -52,10 +66,38 @@ const smokeMcp = async (executable: string, cwd: string) => {
 	await process.exited
 }
 
+const assertPackageIdentity = (manifest: PackageManifest) => {
+	if (manifest.name !== packageName) throw new Error(`Package name must be ${packageName}, received ${manifest.name}`)
+	if (manifest.repository.type !== "git" || manifest.repository.url !== repositoryUrl) {
+		throw new Error(`Package repository must be ${repositoryUrl}`)
+	}
+	if (manifest.homepage !== "https://github.com/aryasaatvik/motel#readme") {
+		throw new Error("Package homepage must point to the owned repository")
+	}
+	if (manifest.bugs.url !== "https://github.com/aryasaatvik/motel/issues") {
+		throw new Error("Package bugs URL must point to the owned repository")
+	}
+	if (manifest.publishConfig.access !== "public" || manifest.publishConfig.registry !== "https://registry.npmjs.org/") {
+		throw new Error("Package publish configuration must target the public npm registry")
+	}
+	const expectedBins = { motel: "src/motel.ts", "motel-mcp": "src/mcp.ts" }
+	if (JSON.stringify(manifest.bin) !== JSON.stringify(expectedBins)) {
+		throw new Error("Package must expose only the motel and motel-mcp bins")
+	}
+	if (process.env.GITHUB_ACTIONS === "true") {
+		const expectedTag = `v${manifest.version}`
+		if (process.env.GITHUB_REF_TYPE !== "tag" || process.env.GITHUB_REF_NAME !== expectedTag) {
+			throw new Error(`GitHub releases must run from ${expectedTag}`)
+		}
+	}
+}
+
 try {
 	await mkdir(packDir)
-	await mkdir(consumerDir)
+	await mkdir(prefixDir)
 	await run(["bun", "run", "web:build"], root)
+	const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as PackageManifest
+	assertPackageIdentity(packageJson)
 
 	const packOutput = await run(
 		["npm", "pack", "--json", "--pack-destination", packDir],
@@ -63,6 +105,9 @@ try {
 	)
 	const [packed] = JSON.parse(packOutput) as PackResult[]
 	if (!packed) throw new Error("npm pack did not produce an artifact")
+	if (packed.name !== packageJson.name || packed.version !== packageJson.version) {
+		throw new Error("Packed artifact metadata does not match package.json")
+	}
 
 	const included = new Set(packed.files.map((file) => file.path))
 	for (const required of [
@@ -75,20 +120,16 @@ try {
 		if (!included.has(required)) throw new Error(`Packed artifact is missing ${required}`)
 	}
 
-	const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as {
-		readonly name: string
-		readonly version: string
-	}
 	const tarball = path.join(packDir, packed.filename)
 	await Bun.write(
-		path.join(consumerDir, "package.json"),
-		JSON.stringify({ private: true, dependencies: { [packageJson.name]: `file:${tarball}` } }, null, 2),
+		path.join(prefixDir, "package.json"),
+		JSON.stringify({ private: true }, null, 2),
 	)
-	await run(["bun", "install", "--no-save"], consumerDir)
+	await run(["npm", "install", "--prefix", prefixDir, "--no-save", "--ignore-scripts", tarball], root)
 
-	const motel = path.join(consumerDir, "node_modules", ".bin", "motel")
-	const motelMcp = path.join(consumerDir, "node_modules", ".bin", "motel-mcp")
-	const help = await run([motel, "--help"], consumerDir)
+	const motel = path.join(prefixDir, "node_modules", ".bin", "motel")
+	const motelMcp = path.join(prefixDir, "node_modules", ".bin", "motel-mcp")
+	const help = await run([motel, "--help"], prefixDir)
 	if (!help.includes("motel daemon")) throw new Error("Packed motel binary did not print its help output")
 	const runtimeDir = path.join(temp, "runtime")
 	await mkdir(runtimeDir)
@@ -97,29 +138,29 @@ try {
 		MOTEL_RUNTIME_DIR: runtimeDir,
 		MOTEL_OTEL_DB_PATH: path.join(runtimeDir, "telemetry.sqlite"),
 	}
-	const installedRoot = path.join(consumerDir, "node_modules", "@kitlangton", "motel")
+	const installedRoot = path.join(prefixDir, "node_modules", ...packageJson.name.split("/"))
 	await run([
 		"bun",
 		"-e",
 		`const { Effect } = await import("effect"); const { storeRuntime } = await import(${JSON.stringify(path.join(installedRoot, "src", "runtime.ts"))}); const { TelemetryStore } = await import(${JSON.stringify(path.join(installedRoot, "src", "services", "TelemetryStore.ts"))}); await storeRuntime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.listServices)); await storeRuntime.dispose()`,
-	], consumerDir, { env: runtimeEnv })
+	], prefixDir, { env: runtimeEnv })
 	try {
-		const services = await run([motel, "services"], consumerDir, { env: runtimeEnv })
+		const services = await run([motel, "services"], prefixDir, { env: runtimeEnv })
 		if (!services.trim().startsWith("[")) throw new Error("Packed motel binary did not query services")
 	} finally {
-		await run([motel, "stop"], consumerDir, { env: runtimeEnv }).catch(() => undefined)
+		await run([motel, "stop"], prefixDir, { env: runtimeEnv }).catch(() => undefined)
 	}
-	await smokeMcp(motelMcp, consumerDir)
+	await smokeMcp(motelMcp, prefixDir)
 
 	const reportedVersion = await run(
 		["bun", "-e", `import { MOTEL_VERSION } from ${JSON.stringify(path.join(installedRoot, "src", "registry.ts"))}; console.log(MOTEL_VERSION)`],
-		consumerDir,
+		prefixDir,
 	)
 	if (reportedVersion.trim() !== packageJson.version) {
 		throw new Error(`Runtime version ${reportedVersion.trim()} does not match package version ${packageJson.version}`)
 	}
 
-	console.log(`Validated ${packed.filename} from a clean consumer`)
+	console.log(`Validated ${packed.filename} from an isolated temporary prefix`)
 } finally {
 	await rm(temp, { recursive: true, force: true })
 }
