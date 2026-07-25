@@ -3,6 +3,10 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 
+import rootPackage from "../package.json" with { type: "json" }
+
+const expectedVersion = `${rootPackage.version}\n`
+
 const motel = async (...args: ReadonlyArray<string>) => {
 	const child = Bun.spawn({
 		cmd: [process.execPath, "run", "src/motel.ts", ...args],
@@ -52,7 +56,7 @@ describe("motel command tree", () => {
 		for (const flag of ["--version", "-v"]) {
 			const result = await motel(flag)
 			expect(result.exitCode).toBe(0)
-			expect(result.stdout).toBe("0.2.6\n")
+			expect(result.stdout).toBe(expectedVersion)
 			expect(result.stderr).toBe("")
 		}
 	})
@@ -161,7 +165,7 @@ describe("motel command tree", () => {
 				new Response(installed.stderr).text(),
 			])
 			expect(exitCode).toBe(0)
-			expect(stdout).toBe("0.2.6\n")
+			expect(stdout).toBe(expectedVersion)
 			expect(stderr).toBe("")
 			await assertMcpStartsCleanly([path.join(prefix, "node_modules/.bin/motel"), "mcp"], prefix)
 			await assertMcpStartsCleanly([path.join(prefix, "node_modules/.bin/motel-mcp")], prefix)
