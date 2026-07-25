@@ -33,14 +33,14 @@
 
 ## Release Strategy
 - npm package: `@aryasaatvik/motel`
-- The package is created by an attended first publish; GitHub Actions OIDC publishing is enabled only after that setup.
+- Releases are run from an attended local session with Tegami; GitHub Actions only validates pull requests.
 - Tags are versioned as `vX.Y.Z` (`git tag --sort=-version:refname` shows `v0.2.4`, `v0.2.3`, ...)
-- Publishing is handled by GitHub Actions in `.github/workflows/publish.yml`, not by local manual `npm publish`
-- The publish workflow triggers only on `git push` of tags matching `v*`.
-- The workflow runs `bun install --frozen-lockfile`, `bun run typecheck`, `bun run test`, `bun run web:build`, and `bun run release:validate` before `npm publish --provenance`.
-- Before tagging a release, make sure the committed `package.json` version matches the intended git tag exactly
-- Preferred release flow: complete the attended first package creation and npm trusted-publisher setup, then update `package.json` version, commit the release changes, create tag `v<package.json version>`, push the commit and tag, then verify the GitHub Actions publish and npm dist-tags
-- Do not create or push release tags from a dirty worktree with unrelated uncommitted changes; ask before including unrelated edits in a release
+- Add user-facing release notes under `.tegami/` and commit them with the implementation they describe.
+- `bun run version:packages` consumes pending entries, updates the package version and changelog, writes the publish lock, and opens or updates `tegami/version-packages` against `dev`.
+- After the version pull request is merged, run `bun run release` from a clean, current `dev` branch with npm and GitHub CLI authentication.
+- The release command runs typechecks, Effect diagnostics, tests, and package validation before Tegami publishes npm, pushes the matching `v<version>` tag, and creates the GitHub Release.
+- See `docs/release.md` for the attended release and verification procedure.
+- Publishing does not install or restart the machine-global Motel service; that cutover is a separate operation.
 
 ## Effect LSP
 The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugins` entry. Editors that pick up the TypeScript workspace plugin (Zed, VSCode, Cursor, NVim via vtsls) will surface Effect-specific diagnostics, quick fixes, and refactors inline. In Zed this requires selecting the workspace TypeScript version — it does so automatically when `node_modules/typescript` is present.
