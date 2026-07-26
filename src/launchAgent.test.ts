@@ -323,6 +323,22 @@ describe("supervisor-aware top-level lifecycle", () => {
 		expect(events).toEqual(["service:start", "service:stop", "service:restart"])
 	})
 
+	test("stops a detached daemon when an equivalent LaunchAgent definition is not loaded", async () => {
+		const events: string[] = []
+		const daemon = {
+			applyEnv: Effect.void,
+			getStatus: Effect.succeed(daemonStatus()),
+			ensure: Effect.sync(() => { events.push("daemon:start"); return daemonStatus() }),
+			stop: Effect.sync(() => { events.push("daemon:stop"); return daemonStatus({ running: false, pid: null, registryPid: null }) }),
+		} satisfies DaemonManager
+		const lifecycle = createMotelLifecycle({
+			service: fakeService({ installed: true, manager: "not-loaded" }, events),
+			daemon,
+		})
+		await Effect.runPromise(lifecycle.stop)
+		expect(events).toEqual(["daemon:stop"])
+	})
+
 	test("keeps detached-manager lifecycle when no service definition is installed", async () => {
 		const events: string[] = []
 		const daemon = {

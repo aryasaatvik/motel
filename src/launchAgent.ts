@@ -447,7 +447,9 @@ export const createMotelLifecycle = (options: { readonly service?: LaunchAgentMa
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.start, daemon.ensure))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.ensure,
 		stop: serviceEnabled
-			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.stop, daemon.stop))) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
+			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> =>
+				route(status, status.manager === "loaded" ? service.stop : daemon.stop, daemon.stop),
+			)) as Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never>
 			: daemon.stop,
 		restart: serviceEnabled
 			? service.status.pipe(Effect.flatMap((status): Effect.Effect<DaemonStatus | LaunchAgentStatus, unknown, never> => route(status, service.restart, Effect.gen(function*() {
