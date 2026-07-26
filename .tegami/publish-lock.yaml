@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: minor\n---\n\n## Establish maintained fork ownership\n\nPublish Motel under `@aryasaatvik/motel` from the maintained fork while preserving the `motel`\nand `motel-mcp` executable names.\n\n## Adopt an Effect-native CLI\n\nReplace the manual argument router with Effect's CLI primitives, provide generated command help and\nvalidation, and report the installed package version through `motel --version`.\n\n## Manage the machine-global service\n\nAdd native LaunchAgent install, uninstall, and status commands while preserving Motel's foreground\n`server` mode and managed-daemon identity.\n\n## Upgrade Effect\n\nUpgrade Motel to the applicable Effect v4 beta used by the new CLI and runtime integration.\n"
-    filename: maintained-fork.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Stop detached daemons during LaunchAgent transitions\n\nMake `motel stop` terminate a verified detached daemon when the per-user LaunchAgent definition\nexists but is not currently loaded.\n"
+    filename: stop-unloaded-daemon.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - maintained-fork.md
+      - stop-unloaded-daemon.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:

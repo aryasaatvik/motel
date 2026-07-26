@@ -1,3 +1,10 @@
+## @aryasaatvik/motel@0.3.1
+
+### Stop detached daemons during LaunchAgent transitions
+
+Make `motel stop` terminate a verified detached daemon when the per-user LaunchAgent definition
+exists but is not currently loaded.
+
 ## @aryasaatvik/motel@0.3.0
 
 ### Establish maintained fork ownership
