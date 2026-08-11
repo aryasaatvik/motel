@@ -539,6 +539,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			`)
 		} else {
 			db.exec(`
+				-- Wait for an existing writer to release startup locks before any
+				-- pragma that may need to update the database header.
+				PRAGMA busy_timeout = 15000;
 				-- Bump cache above the 2MB default. 64MB fits most hot index pages
 				-- (trace_summaries, spans, span_attributes indexes) in RAM even on
 				-- multi-GB databases, cutting cold-read latency meaningfully on
@@ -557,8 +560,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			// existing DBs that predate this setting keep their current mode;
 			// Motel never performs a surprise full-file VACUUM at startup.
 			try { db.exec(`PRAGMA auto_vacuum = INCREMENTAL;`) } catch { /* ignore */ }
-			try {
-				db.exec(`
+			db.exec(`
 					PRAGMA journal_mode = WAL;
 					PRAGMA synchronous = NORMAL;
 					PRAGMA temp_store = MEMORY;
@@ -656,11 +658,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						key TEXT PRIMARY KEY,
 						value TEXT NOT NULL
 					);
-				`)
-			} catch (err) {
-				if (!isSqliteLockError(err)) throw err
-				console.warn(`motel: writer bootstrap skipped during startup: ${(err as Error).message}`)
-			}
+			`)
 		}
 
 		// Tables detected at runtime. For writer connections these flags are

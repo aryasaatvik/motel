@@ -45,12 +45,13 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus } = {}) => {
+const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus; readonly readyAfter?: number } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	let launchctlPrintExitCode = options.launchctlPrintExitCode ?? 113
 	const calls: Array<readonly string[]> = []
 	const fileEvents: string[] = []
+	let probeCalls = 0
 	const files = new Map<string, string>()
 	const operations: LaunchAgentOperations = {
 		platform: "darwin",
@@ -73,9 +74,10 @@ const makeHarness = (options: { readonly installed?: boolean; readonly missingEx
 			return { exitCode: 0, stdout: "", stderr: "" }
 		},
 		getDaemonStatus: async () => options.health ?? daemonStatus(),
+		probeDaemonIngest: async () => ++probeCalls > (options.readyAfter ?? 0),
 		version: "0.2.6",
 	}
-	return { calls, fileEvents, manager: createLaunchAgentManager(spec, operations) }
+	return { calls, fileEvents, get probeCalls() { return probeCalls }, manager: createLaunchAgentManager(spec, operations) }
 }
 
 describe("LaunchAgent specification", () => {
@@ -211,8 +213,9 @@ describe("LaunchAgent lifecycle", () => {
 	})
 
 	test("bootstraps an unloaded service before restarting it", async () => {
-		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 113 })
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 113, readyAfter: 2 })
 		await Effect.runPromise(harness.manager.restart)
+		expect(harness.probeCalls).toBe(3)
 		expect(harness.calls.filter(([command]) => command === "launchctl")).toEqual([
 			["launchctl", "print", spec.target],
 			["launchctl", "bootstrap", spec.domain, spec.plistPath],
@@ -276,6 +279,7 @@ describe("LaunchAgent lifecycle", () => {
 					return { exitCode: 0, stdout: "", stderr: "" }
 				},
 				getDaemonStatus: async () => daemonStatus(),
+				probeDaemonIngest: async () => true,
 				version: "0.2.6",
 			} satisfies LaunchAgentOperations),
 		})

@@ -50,6 +50,7 @@ export type LaunchAgentOperations = {
 	readonly unlink: (file: string) => Promise<void>
 	readonly run: (command: string, args: readonly string[]) => Promise<CommandResult>
 	readonly getDaemonStatus: () => Promise<DaemonStatus>
+	readonly probeDaemonIngest: () => Promise<boolean>
 	readonly version: string
 }
 
@@ -206,6 +207,20 @@ export const compareLaunchAgent = (inspection: LaunchAgentInspection, spec: Laun
 
 const defaultOperations = (): LaunchAgentOperations => {
 	const daemon = createDaemonManager()
+	const probeDaemonIngest = async () => {
+		try {
+			const post = (path: string) => fetch(`http://127.0.0.1:27686${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+				signal: AbortSignal.timeout(3_000),
+			})
+			const [traces, logs] = await Promise.all([post("/v1/traces"), post("/v1/logs")])
+			return traces.ok && logs.ok
+		} catch {
+			return false
+		}
+	}
 	return {
 		exists: async (file) => fs.access(file).then(() => true).catch(() => false),
 		readFile: (file) => fs.readFile(file, "utf8"),
@@ -219,6 +234,7 @@ const defaultOperations = (): LaunchAgentOperations => {
 			return { exitCode, stdout, stderr }
 		},
 		getDaemonStatus: () => Effect.runPromise(daemon.getStatus),
+		probeDaemonIngest,
 		version: MOTEL_VERSION,
 		platform: process.platform,
 	}
@@ -299,6 +315,19 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			}
 		}
 	}
+	const waitForReady = async () => {
+		const deadline = Date.now() + 30_000
+		while (Date.now() < deadline) {
+			const health = await operations.getDaemonStatus()
+			if (health.running && health.managed && await operations.probeDaemonIngest()) return health
+			await Bun.sleep(100)
+		}
+		throw new LaunchAgentError("Motel LaunchAgent did not become ingest-ready within 30 seconds.")
+	}
+	const readyStatus = async () => {
+		await waitForReady()
+		return Effect.runPromise(status)
+	}
 	const inspect = Effect.tryPromise({ try: () => readInspection(operations, spec), catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)) })
 	const status = Effect.tryPromise({
 		try: async (): Promise<LaunchAgentStatus> => {
@@ -332,7 +361,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 				await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 				await required(operations, "launchctl", ["enable", spec.target])
 				await required(operations, "launchctl", ["kickstart", "-k", spec.target])
-				return Effect.runPromise(status)
+				return readyStatus()
 			}
 			await requireExecutables()
 			if (manager === "loaded" && !replace) throw new LaunchAgentError("Motel has a loaded LaunchAgent job that does not match the requested install state. Re-run with --replace to boot it out before installing.")
@@ -342,7 +371,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["enable", spec.target])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
-			return Effect.runPromise(status)
+			return readyStatus()
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
@@ -353,7 +382,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
 			if (manager === "not-loaded") await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
-			return Effect.runPromise(status)
+			return readyStatus()
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
@@ -374,7 +403,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
 			if (manager === "not-loaded") await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])
-			return Effect.runPromise(status)
+			return readyStatus()
 		},
 		catch: (error) => error instanceof LaunchAgentError ? error : new LaunchAgentError(error instanceof Error ? error.message : String(error)),
 	})
