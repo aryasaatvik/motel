@@ -8,6 +8,7 @@
         "@effect/atom-react": "4.0.0-beta.101",
         "@effect/opentelemetry": "4.0.0-beta.101",
         "@effect/platform-bun": "4.0.0-beta.101",
+        "@effect/platform-node-shared": "4.0.0-beta.101",
         "@opentelemetry/api": "^1.9.0",
         "@opentelemetry/exporter-logs-otlp-http": "^0.219.0",
         "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
