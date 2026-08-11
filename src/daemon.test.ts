@@ -226,6 +226,35 @@ describe("daemon manager", () => {
 		expect(finalStatus.running).toBe(false)
 	})
 
+	test("keeps one ingest generation usable after concurrent client aborts", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		const started = await Effect.runPromise(harness.manager.ensure)
+
+		await Promise.all(Array.from({ length: 50 }, async () => {
+			const controller = new AbortController()
+			const request = fetch(`http://127.0.0.1:${harness.port}/v1/traces`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+				signal: controller.signal,
+			}).catch(() => undefined)
+			controller.abort()
+			await request
+		}))
+
+		for (const path of ["/v1/traces", "/v1/logs"]) {
+			const response = await fetch(`http://127.0.0.1:${harness.port}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+			})
+			expect(response.ok).toBe(true)
+		}
+		const status = await Effect.runPromise(harness.manager.ensure)
+		expect(status.pid).toBe(started.pid)
+	})
+
 	test("health responds while ingest readiness waits for a write lock", async () => {
 		const harness = makeHarness()
 		activeHarnesses.push(harness)
