@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Stop detached daemons during LaunchAgent transitions\n\nMake `motel stop` terminate a verified detached daemon when the per-user LaunchAgent definition\nexists but is not currently loaded.\n"
-    filename: stop-unloaded-daemon.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Stabilize managed telemetry ingestion\n\nManaged Motel services now wait until trace and log ingestion are ready before reporting startup\nsuccess. Aborted requests no longer replace shared telemetry workers, and SQLite initialization\nwaits for writer locks instead of continuing with an unusable store.\n"
+    filename: 2026-08-11-ingest-readiness.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - stop-unloaded-daemon.md
+      - 2026-08-11-ingest-readiness.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
