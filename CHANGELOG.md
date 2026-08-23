@@ -1,3 +1,11 @@
+## @aryasaatvik/motel@0.3.3
+
+### Run Motel on Effect 4 RC
+
+Motel now ships on Effect `4.0.0-rc.110` instead of the beta line. The MCP
+server advertises the published protocol revisions, and `motel service install`
+still treats `--replace` as optional.
+
 ## @aryasaatvik/motel@0.3.2
 
 ### Stabilize managed telemetry ingestion
