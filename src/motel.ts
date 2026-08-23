@@ -39,7 +39,9 @@ const restart = Command.make("restart", {}, () =>
 ).pipe(Command.withDescription("Restart only the managed telemetry daemon"))
 
 const serviceManager = createLaunchAgentManager()
-const serviceInstall = Command.make("install", { replace: Flag.boolean("replace") }, ({ replace }) =>
+const serviceInstall = Command.make("install", {
+	replace: Flag.boolean("replace").pipe(Flag.withDefault(false)),
+}, ({ replace }) =>
 	serviceManager.install(replace).pipe(Effect.andThen(json)),
 ).pipe(Command.withDescription("Install the per-user Motel LaunchAgent"))
 const serviceStatus = Command.make("status", {}, () =>
