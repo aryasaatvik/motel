@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Stabilize managed telemetry ingestion\n\nManaged Motel services now wait until trace and log ingestion are ready before reporting startup\nsuccess. Aborted requests no longer replace shared telemetry workers, and SQLite initialization\nwaits for writer locks instead of continuing with an unusable store.\n"
-    filename: 2026-08-11-ingest-readiness.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Run Motel on Effect 4 RC\n\nMotel now ships on Effect `4.0.0-rc.110` instead of the beta line. The MCP\nserver advertises the published protocol revisions, and `motel service install`\nstill treats `--replace` as optional.\n"
+    filename: 2026-08-23-effect-rc.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - 2026-08-11-ingest-readiness.md
+      - 2026-08-23-effect-rc.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
