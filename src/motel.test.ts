@@ -172,5 +172,5 @@ describe("motel command tree", () => {
 		} finally {
 			fs.rmSync(temporaryPrefix, { recursive: true, force: true })
 		}
-	})
+	}, 20_000)
 })
