@@ -1,3 +1,10 @@
+## @aryasaatvik/motel@0.3.4
+
+### Run Motel on Effect 4 RC 112
+
+Motel now ships on Effect `4.0.0-rc.112`. The release workflow also publishes
+through npm trusted publishing from GitHub Actions without an `NPM_TOKEN`.
+
 ## @aryasaatvik/motel@0.3.3
 
 ### Run Motel on Effect 4 RC
