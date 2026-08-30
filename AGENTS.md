@@ -33,13 +33,13 @@
 
 ## Release Strategy
 - npm package: `@aryasaatvik/motel`
-- Releases are run from an attended local session with Tegami; GitHub Actions only validates pull requests.
+- Releases are run by the default `dev` branch GitHub Action with Tegami and npm trusted publishing; local sessions only prepare or verify releases.
 - Tags are versioned as `vX.Y.Z` (`git tag --sort=-version:refname` shows `v0.2.4`, `v0.2.3`, ...)
 - Add user-facing release notes under `.tegami/` and commit them with the implementation they describe.
 - `bun run version:packages` consumes pending entries, updates the package version and changelog, writes the publish lock, and opens or updates `tegami/version-packages` against `dev`.
-- After the version pull request is merged, run `bun run release` from a clean, current `dev` branch with npm and GitHub CLI authentication.
-- The release command runs typechecks, Effect diagnostics, tests, and package validation before Tegami publishes npm, pushes the matching `v<version>` tag, and creates the GitHub Release.
-- See `docs/release.md` for the attended release and verification procedure.
+- After the version pull request is merged, the `publish.yml` workflow runs the release checks, then `tegami ci` publishes through npm OIDC, pushes the matching `v<version>` tag, and creates the GitHub Release.
+- The npm trusted publisher is `aryasaatvik/motel` + `publish.yml` with no environment; no `NPM_TOKEN` or npm stage publishing is used.
+- See `docs/release.md` for the workflow and verification procedure.
 - Publishing does not install or restart the machine-global Motel service; that cutover is a separate operation.
 
 ## Effect LSP
