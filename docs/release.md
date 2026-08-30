@@ -1,7 +1,7 @@
 # Releasing Motel
 
-Motel uses Tegami for changelogs, versioning, npm publication, Git tags, and GitHub Releases. Releases
-are run from an attended local session; GitHub Actions only validates pull requests.
+Motel uses Tegami for changelogs, versioning, npm publication, Git tags, and GitHub Releases. The
+default release path runs from the `dev` branch through GitHub Actions and npm trusted publishing.
 
 ## Queue a change
 
@@ -35,16 +35,23 @@ Review and merge that pull request before publishing.
 
 ## Publish
 
-From the clean, current merged `dev` branch, authenticate npm interactively if needed, then run:
+After the version pull request is merged, the `publish.yml` workflow runs from the clean merged
+`dev` branch. It installs dependencies, runs the complete release checks, and then runs:
 
 ```sh
-npm whoami
-GH_TOKEN="$(gh auth token)" bun run release
+bun run release:check && bun run tegami ci
 ```
 
-`bun run release` runs the complete release checks before Tegami publishes the package through Bun,
-creates and pushes the `v<version>` Git tag, and creates the matching GitHub Release. For the first
-owned release, confirm npm creates `@aryasaatvik/motel` as a public package.
+The workflow grants GitHub's OIDC token to npm and has no `NPM_TOKEN` secret. Tegami uses npm to
+publish the package, creates and pushes the `v<version>` Git tag, and creates the matching GitHub
+Release.
+
+The npm trusted publisher must be configured as:
+
+- Repository: `aryasaatvik/motel`
+- Workflow filename: `publish.yml`
+- Environment: blank
+- Publishing method: npm publish only
 
 Verify the result:
 
@@ -54,7 +61,7 @@ npm view @aryasaatvik/motel dist-tags --json
 gh release view "v$(bun -e 'console.log(require("./package.json").version)')"
 ```
 
-Do not publish from a dirty worktree or rerun a partially completed release without first checking
+Do not merge a version pull request or rerun a partially completed workflow without first checking
 the npm version, Git tag, GitHub Release, and Tegami publish status.
 
 Publishing does not install or restart the machine-global Motel service. The maintained checkout and
