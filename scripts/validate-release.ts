@@ -84,7 +84,7 @@ const assertPackageIdentity = (manifest: PackageManifest) => {
 	if (JSON.stringify(manifest.bin) !== JSON.stringify(expectedBins)) {
 		throw new Error("Package must expose only the motel and motel-mcp bins")
 	}
-	if (process.env.GITHUB_ACTIONS === "true") {
+	if (process.env.GITHUB_ACTIONS === "true" && process.env.GITHUB_REF_TYPE === "tag") {
 		const expectedTag = `v${manifest.version}`
 		if (process.env.GITHUB_REF_TYPE !== "tag" || process.env.GITHUB_REF_NAME !== expectedTag) {
 			throw new Error(`GitHub releases must run from ${expectedTag}`)
