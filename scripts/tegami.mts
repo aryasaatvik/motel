@@ -24,7 +24,13 @@ if (rootPackage.name !== "@aryasaatvik/motel") throw new Error("unexpected relea
 
 const paper = tegami({
   ignore: ["motel-web"],
-  npm: { client: "bun" },
+  npm: {
+    client: "bun",
+    trustedPublish: {
+      provider: "github",
+      workflow: "publish.yml",
+    },
+  },
   packages: {
     "@aryasaatvik/motel": {},
   },
