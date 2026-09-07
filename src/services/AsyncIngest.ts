@@ -20,11 +20,12 @@
  */
 
 import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Context, Effect, Layer, Scope, Schema } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import type { WorkerError } from "effect/unstable/workers/WorkerError"
+import { IngestProgress, WriterEvent, type IngestReadiness } from "../ingestReadiness.ts"
 import { IngestRpcs } from "./ingestRpc.ts"
 
 // RpcClient.make always surfaces RpcClientError in addition to the
@@ -34,23 +35,35 @@ import { IngestRpcs } from "./ingestRpc.ts"
 // unrelated structural mismatches.
 export class AsyncIngest extends Context.Service<
 	AsyncIngest,
-	RpcClient.FromGroup<typeof IngestRpcs, RpcClientError | WorkerError>
+	RpcClient.FromGroup<typeof IngestRpcs, RpcClientError | WorkerError> & { readonly readiness: Effect.Effect<IngestReadiness> }
 >()("@motel/AsyncIngest") {}
-
-// Protocol: RpcClient.layerProtocolWorker manages a worker pool and
-// speaks msgpack over structured-clone messages. `size: 1` matches
-// SQLite's single-writer constraint.
-const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
-	Layer.provide(RpcSerialization.layerMsgPack),
-	Layer.provide(
-		BunWorker.layer(() => new Worker(new URL("./telemetryWorker.ts", import.meta.url))),
-	),
-)
 
 export const AsyncIngestLive = Layer.effect(
 	AsyncIngest,
 	Effect.gen(function*() {
 		const scope = yield* Scope.Scope
+		const progress = new IngestProgress()
+		const channelName = `motel-ingest-${crypto.randomUUID()}`
+		const channel = yield* Effect.acquireRelease(
+			Effect.sync(() => new BroadcastChannel(channelName)),
+			(channel) => Effect.sync(() => channel.close()),
+		)
+		channel.onmessage = ({ data }) => {
+			const event = Schema.decodeUnknownSync(WriterEvent)(data)
+			progress.receive(event)
+		}
+		const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
+			Layer.provide(RpcSerialization.layerMsgPack),
+			Layer.provide(BunWorker.layer(() => {
+				const worker = new Worker(new URL("./telemetryWorker.ts", import.meta.url), {
+					env: { ...process.env, MOTEL_INGEST_DIAGNOSTICS_CHANNEL: channelName },
+				})
+				worker.addEventListener("error", () => progress.fail())
+				worker.addEventListener("close", () => progress.fail())
+				return worker
+			})),
+		)
+
 		// Keep daemon startup cheap: creating the RPC client here would eagerly
 		// spawn the worker and make /api/health wait on the worker's SQLite
 		// bootstrap. Cache a lazy initializer instead so the worker only starts
@@ -59,7 +72,7 @@ export const AsyncIngestLive = Layer.effect(
 		// failures must not replace it: concurrent stale failures can otherwise
 		// invalidate a newer cached generation and orphan its SQLite writer and
 		// maintenance fibers. A poisoned worker stays failed until the managed
-		// daemon is restarted, which the external ingest readiness probe handles.
+		// daemon is restarted, and diagnostics expose that failure for explicit operator recovery.
 		const getClient = yield* Effect.cached(Effect.gen(function*() {
 			const clientScope = yield* Scope.fork(scope, "sequential")
 			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
@@ -71,10 +84,17 @@ export const AsyncIngestLive = Layer.effect(
 		// Start the sole writer/maintenance worker immediately, but do not make
 		// HTTP health wait for SQLite bootstrap. Managed readiness still verifies
 		// the worker through explicit ingest probes.
-		yield* Effect.forkScoped(getClient.pipe(Effect.ignore))
+		yield* Effect.forkScoped(getClient.pipe(Effect.tapCause(() => Effect.sync(() => progress.fail())), Effect.ignore))
+		const track = <A, E, R>(bytes: number, effect: Effect.Effect<A, E, R>) =>
+			Effect.acquireUseRelease(
+				Effect.sync(() => progress.begin(bytes)),
+				() => effect,
+				(finish) => Effect.sync(finish),
+			)
 		return {
-			ingestTraces: (input, options) => Effect.flatMap(getClient, (client) => client.ingestTraces(input, options)),
-			ingestLogs: (input, options) => Effect.flatMap(getClient, (client) => client.ingestLogs(input, options)),
+			readiness: Effect.sync(() => progress.snapshot()),
+			ingestTraces: (input, options) => track(input.bytes ?? 0, Effect.flatMap(getClient, (client) => client.ingestTraces(input, options))),
+			ingestLogs: (input, options) => track(input.bytes ?? 0, Effect.flatMap(getClient, (client) => client.ingestLogs(input, options))),
 		}
 	}),
 )

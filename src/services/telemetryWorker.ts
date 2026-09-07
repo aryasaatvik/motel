@@ -20,8 +20,13 @@ import { Effect, Layer } from "effect"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import type { OtlpLogExportRequest, OtlpTraceExportRequest } from "../otlp.ts"
+import { WriterDiagnostics, type WriterEvent } from "../ingestReadiness.ts"
 import { IngestError, IngestRpcs } from "./ingestRpc.ts"
 import { TelemetryStore, TelemetryStoreWorkerLive } from "./TelemetryStore.ts"
+
+const channelName = process.env.MOTEL_INGEST_DIAGNOSTICS_CHANNEL
+const channel = channelName ? new BroadcastChannel(channelName) : undefined
+const publish = (event: WriterEvent) => channel?.postMessage(event)
 
 // Wire the two RPC methods to the existing TelemetryStore service.
 // The store's ingest methods already carry their own Effect.fn spans,
@@ -32,13 +37,16 @@ import { TelemetryStore, TelemetryStoreWorkerLive } from "./TelemetryStore.ts"
 const IngestHandlers = IngestRpcs.toLayer(
 	Effect.gen(function*() {
 		const store = yield* TelemetryStore
+		publish({ _tag: "ready" })
 		return {
 			ingestTraces: ({ payload }) =>
 				store.ingestTraces(payload as OtlpTraceExportRequest).pipe(
+					Effect.tap((result) => Effect.sync(() => publish({ _tag: "commit", records: result.insertedSpans, at: Date.now() }))),
 					Effect.mapError((cause) => new IngestError({ message: String(cause) })),
 				),
 			ingestLogs: ({ payload }) =>
 				store.ingestLogs(payload as OtlpLogExportRequest).pipe(
+					Effect.tap((result) => Effect.sync(() => publish({ _tag: "commit", records: result.insertedLogs, at: Date.now() }))),
 					Effect.mapError((cause) => new IngestError({ message: String(cause) })),
 				),
 		}
@@ -56,4 +64,4 @@ const WorkerLive = RpcServer.layer(IngestRpcs).pipe(
 // BunRuntime.runMain installs signal handlers so the scope closes
 // cleanly on termination; the BunHttpServer layer pattern from the
 // main server carries over here.
-Layer.launch(WorkerLive).pipe(BunRuntime.runMain)
+Layer.launch(WorkerLive).pipe(Effect.provideService(WriterDiagnostics, publish), Effect.ensuring(Effect.sync(() => channel?.close())), BunRuntime.runMain)

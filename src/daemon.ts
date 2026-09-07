@@ -1,7 +1,8 @@
 import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
+import { IngestReadiness } from "./ingestReadiness.ts"
 import { isAlive, isManagedDaemonProcess, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, processIdentity, removeRegistryEntry, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
@@ -58,6 +59,7 @@ type DaemonConfig = {
 }
 
 export type DaemonStatus = {
+	readonly readiness?: IngestReadiness
 	readonly running: boolean
 	readonly managed: boolean
 	readonly service: string | null
@@ -170,13 +172,13 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 	}
 
-	const fetchIngestProbe = async () => {
+	const fetchIngestProbe = async (timeoutMs = INGEST_PROBE_TIMEOUT_MS) => {
 		try {
 			const postEmpty = (path: string) => fetch(`${config.baseUrl}${path}`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: "{}",
-				signal: AbortSignal.timeout(INGEST_PROBE_TIMEOUT_MS),
+				signal: AbortSignal.timeout(timeoutMs),
 			})
 			const [traces, logs] = await Promise.all([postEmpty("/v1/traces"), postEmpty("/v1/logs")])
 			return traces.ok && logs.ok
@@ -198,47 +200,55 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const readLock = async (): Promise<LockShape | null> => {
 		try {
 			const raw = await fsp.readFile(config.lockPath, "utf8")
-			return JSON.parse(raw) as LockShape
+			const lock = JSON.parse(raw) as Partial<LockShape>
+			if (!Number.isInteger(lock.pid) || (lock.pid ?? 0) <= 0 || typeof lock.createdAt !== "string" ||
+				(lock.processIdentity !== undefined && typeof lock.processIdentity !== "string")) return null
+			return lock as LockShape
 		} catch {
 			return null
 		}
 	}
 
 	const removeStaleLock = async () => {
-		const current = await readLock()
-		if (!current) {
+		// Serialize stale-owner cleanup so two contenders cannot unlink a fresh
+		// replacement after both observed the same dead owner. Unknown lock contents
+		// fail closed: they may belong to an older writer still publishing its lock.
+		const recoveryPath = `${config.lockPath}.recovery`
+		try { await fsp.mkdir(recoveryPath) }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
+			throw error
+		}
+		try {
+			const current = await readLock()
+			if (!current) return false
+			if (current.processIdentity ? processIdentity(current.pid) === current.processIdentity : isAlive(current.pid)) return false
 			await fsp.rm(config.lockPath, { force: true })
 			return true
-		}
-		if (current.processIdentity ? processIdentity(current.pid) === current.processIdentity : isAlive(current.pid)) return false
-		await fsp.rm(config.lockPath, { force: true })
-		return true
+		} finally { await fsp.rmdir(recoveryPath) }
 	}
 
 	const acquireStartupLock = async () => {
 		const deadline = Date.now() + LOCK_TIMEOUT_MS
 		await fsp.mkdir(config.runtimeDir, { recursive: true })
-
-		while (Date.now() < deadline) {
-			try {
-				const handle = await fsp.open(config.lockPath, "wx")
-				const contents = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), processIdentity: processIdentity(process.pid) ?? undefined } satisfies LockShape)
-				await handle.writeFile(contents, "utf8")
-				return {
-					release: async () => {
-						await handle.close().catch(() => undefined)
-						await fsp.rm(config.lockPath, { force: true }).catch(() => undefined)
-					},
+		const candidate = `${config.lockPath}.${process.pid}.${crypto.randomUUID()}`
+		const contents = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), processIdentity: processIdentity(process.pid) ?? undefined } satisfies LockShape)
+		await fsp.writeFile(candidate, contents, { flag: "wx" })
+		try {
+			while (Date.now() < deadline) {
+				try {
+					// link is exclusive and publishes a complete file atomically. Unlike
+					// open("wx") followed by writeFile, there is no observable empty lock.
+					await fsp.link(candidate, config.lockPath)
+					return { release: () => fsp.rm(config.lockPath, { force: true }) }
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+					if (await removeStaleLock()) continue
+					await sleep(POLL_INTERVAL_MS)
 				}
-			} catch (error) {
-				const errno = error as NodeJS.ErrnoException
-				if (errno.code !== "EEXIST") throw error
-				if (await removeStaleLock()) continue
-				await sleep(POLL_INTERVAL_MS)
 			}
-		}
-
-		throw new Error(`Timed out waiting for daemon startup lock at ${config.lockPath}`)
+			throw new Error(`Timed out waiting for daemon startup lock at ${config.lockPath}. Inspect its owner and ${config.lockPath}.recovery before recovery.`)
+		} finally { await fsp.rm(candidate, { force: true }) }
 	}
 
 	const openLogFile = async () => {
@@ -321,8 +331,18 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 
 		const mismatch = describeManagedMismatch(health)
+		let readiness: IngestReadiness | undefined
+		if (mismatch === null) {
+			try {
+				const response = await fetch(`${config.baseUrl}/api/readiness`, { signal: AbortSignal.timeout(timeoutMs) })
+				if (response.status === 200 || response.status === 503) {
+					readiness = Schema.decodeUnknownSync(IngestReadiness)(await response.json())
+				}
+			} catch { /* Older daemons can still answer the identity handshake. */ }
+		}
 		const managed = mismatch === null && registry?.pid === health.pid && registry.instanceId === health.instanceId && isManagedDaemonProcess(registry)
 		return {
+			readiness,
 			running: mismatch === null,
 			managed,
 			service: health.service,
@@ -340,6 +360,21 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 	}
 
+	const awaitExistingIngest = async (existing: DaemonStatus): Promise<DaemonStatus> => {
+		if (existing.pid === process.pid) return existing
+		const deadline = Date.now() + startTimeoutMs
+		while (Date.now() < deadline) {
+			if (await fetchIngestProbe(Math.max(1, Math.min(INGEST_PROBE_TIMEOUT_MS, deadline - Date.now())))) {
+				const current = await getStatus()
+				if (current.running && current.managed) return current
+				break
+			}
+			if (existing.readiness?.state === "failed") break
+			await sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())))
+		}
+		throw new Error("Existing managed Motel daemon is not ingest-ready. Its process was preserved; inspect `motel status` and recover explicitly.")
+	}
+
 	const ensure = async (): Promise<DaemonStatus> => {
 		// Use the patient timeout for the initial probe — this is the
 		// critical "is there already a daemon here?" check. A false
@@ -351,10 +386,11 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			// /api/health can stay healthy after the lazy ingest worker/RPC path
 			// has been poisoned by an interrupted request. Empty OTLP posts are
 			// side-effect free and exercise the same path real exporters need.
-			if (existing.pid === process.pid || await fetchIngestProbe()) return existing
-			if (existingEntry) await stopPid(existingEntry)
+			return awaitExistingIngest(existing)
 		}
-		if (!existing.running && existingEntry && isManagedDaemonProcess(existingEntry)) await stopPid(existingEntry)
+		if (!existing.running && existingEntry && isManagedDaemonProcess(existingEntry)) {
+			throw new Error("Registered Motel process is alive but health is unavailable. Its process was preserved; inspect `motel status` before recovery.")
+		}
 		if (existing.service !== null && existing.reason) {
 			throw new Error(existing.reason)
 		}
@@ -369,9 +405,7 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			// while the runtime warms up.
 			const rechecked = await getStatus(HEALTH_PATIENT_TIMEOUT_MS)
 			if (rechecked.managed && rechecked.running) {
-				if (rechecked.pid === process.pid || await fetchIngestProbe()) return rechecked
-				const recheckedEntry = readRegistryEntry()
-				if (recheckedEntry) await stopPid(recheckedEntry)
+				return awaitExistingIngest(rechecked)
 			}
 			if (rechecked.service !== null && rechecked.reason) {
 				throw new Error(rechecked.reason)

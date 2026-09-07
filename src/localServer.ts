@@ -66,12 +66,14 @@ const readOtlpBody = <T>(
 		readonly headers: Readonly<Record<string, string | undefined>>
 	},
 	decodeProtobuf: (bytes: Uint8Array) => T,
-): Effect.Effect<T, unknown> => {
+): Effect.Effect<{ payload: T; bytes: number }, unknown> => {
 	const contentType = (request.headers["content-type"] ?? "").toLowerCase()
-	if (contentType.includes("application/x-protobuf") || contentType.includes("application/protobuf")) {
-		return Effect.map(request.arrayBuffer, (buffer) => decodeProtobuf(new Uint8Array(buffer)))
-	}
-	return Effect.map(request.json, (payload) => payload as T)
+	return Effect.flatMap(request.arrayBuffer, (buffer) => Effect.try(() => ({
+		bytes: buffer.byteLength,
+		payload: contentType.includes("application/x-protobuf") || contentType.includes("application/protobuf")
+			? decodeProtobuf(new Uint8Array(buffer))
+			: JSON.parse(new TextDecoder().decode(buffer)) as T,
+	})))
 }
 
 // Log page loader: takes the parsed list params + any resource-specific
@@ -191,6 +193,10 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 			.handle("health", () =>
 				HttpMiddleware.withLoggerDisabled(Effect.succeed(healthPayload())),
 			)
+			.handleRaw("readiness", () => HttpMiddleware.withLoggerDisabled(
+				Effect.flatMap(AsyncIngest, (ingest) => Effect.map(ingest.readiness,
+					(snapshot) => jsonResponse(snapshot, snapshot.state === "ready" ? 200 : 503))),
+			))
 			// OTLP ingest is routed to the worker thread via AsyncIngest
 			// so the main event loop stays free during heavy SQLite writes.
 			// Read queries use a separate query worker so synchronous SQLite
@@ -199,8 +205,8 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 				HttpMiddleware.withLoggerDisabled(respondRaw(
 					Effect.flatMap(
 						readOtlpBody<OtlpTraceExportRequest>(request, decodeProtobufTraces),
-						(payload) => Effect.map(
-							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestTraces({ payload })),
+						(input) => Effect.map(
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestTraces(input)),
 							(result) => jsonResponse(result),
 						),
 					),
@@ -210,8 +216,8 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 				HttpMiddleware.withLoggerDisabled(respondRaw(
 					Effect.flatMap(
 						readOtlpBody<OtlpLogExportRequest>(request, decodeProtobufLogs),
-						(payload) => Effect.map(
-							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestLogs({ payload })),
+						(input) => Effect.map(
+							Effect.flatMap(AsyncIngest, (ingest) => ingest.ingestLogs(input)),
 							(result) => jsonResponse(result),
 						),
 					),
@@ -551,7 +557,7 @@ export const ServerLive = HttpRouter.serve(
 	// POSTs again on the next flush. This also shaves ~1 KB of header
 	// attributes off every ingest request that would have been written
 	// to the spans table as noise.
-	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/v1/traces", "/v1/logs"])),
+	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/api/readiness", "/v1/traces", "/v1/logs"])),
 	// The telemetry worker owns ingest, migrations, and bounded maintenance.
 	// The HTTP thread only opens an existing database read-only (or bootstraps
 	// a brand-new empty one), keeping health independent of writer work.

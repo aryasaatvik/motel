@@ -6,6 +6,8 @@ import {
 	TraceItem, TraceSummaryItem, SpanItem, LogItem,
 } from "./domain.js"
 
+import { IngestReadiness } from "./ingestReadiness.js"
+
 const ErrorResponse = Schema.Struct({ error: Schema.String })
 const Meta = Schema.Struct({
 	limit: Schema.Number,
@@ -79,6 +81,9 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 				HttpApiEndpoint.get("health", "/api/health", { success: Health })
 					.annotate(OpenApi.Summary, "Health check and identity handshake")
 					.annotate(OpenApi.Description, "Returns liveness plus identity fields (pid, url, workdir, startedAt, version). Doubles as the MCP discovery handshake: clients compare the returned pid against a registry entry to detect stale registrations that now point at an impostor process on the same port."),
+
+				HttpApiEndpoint.get("readiness", "/api/readiness", { success: IngestReadiness, error: IngestReadiness.pipe(HttpApiSchema.status(503)) })
+					.annotate(OpenApi.Summary, "Cached writer readiness and progress; does not enqueue database work"),
 
 				HttpApiEndpoint.post("ingestTraces", "/v1/traces", {
 					payload: Schema.Unknown,
