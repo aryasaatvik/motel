@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite"
 import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
 import { dirname } from "node:path"
 import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
+import { installRetentionSchema, checkpointPassive, mergeFts, retainBatch, repairSearchRows } from "./retention.js"
 import { WriterDiagnostics } from "../ingestReadiness.ts"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
@@ -569,12 +570,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					-- this the WAL happily runs into the hundreds of MB and queries
 					-- start paying the cost of walking the WAL on every read.
 					PRAGMA wal_autocheckpoint = 4000;
-					-- Hard floor for the WAL file. Auto-checkpoint controls *when*
-					-- pages move out of the WAL; size_limit controls how much the
-					-- WAL file is allowed to grow on disk. 128MB is generous enough
-					-- to absorb a long write burst without blocking on truncation,
-					-- tight enough that a wedged retention loop can't hide a 20GB
-					-- WAL the way a default no-limit configuration can.
+					-- Retained WAL size after a reset; not a cap while readers hold snapshots.
 					PRAGMA journal_size_limit = 134217728;
 
 					CREATE TABLE IF NOT EXISTS spans (
@@ -788,6 +784,15 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			try { db.exec(`PRAGMA busy_timeout = 15000;`) } catch { /* ignore */ }
 		} // end: if (!opts.readonly) writer init
 
+		if (!opts.readonly) installRetentionSchema(db)
+		const hasRetention = db.query("SELECT 1 FROM sqlite_master WHERE name = 'retained_spans'").get() !== null
+		const spanSource = hasRetention ? "retained_spans" : "spans"
+		const logSource = hasRetention ? "retained_logs" : "logs"
+		const traceSource = hasRetention ? "retained_trace_summaries" : "trace_summaries"
+		const evictingTrace = hasRetention ? db.query("SELECT 1 FROM retention_traces WHERE trace_id = ?") : null
+		const mapSpanSearch = hasRetention ? db.query("INSERT OR REPLACE INTO span_search_rows VALUES (?, ?, ?)") : null
+		const mapLogSearch = hasRetention ? db.query("INSERT OR REPLACE INTO log_search_rows VALUES (?, ?)") : null
+
 		const insertSpan = db.query(`
 			INSERT INTO spans (
 				trace_id, span_id, parent_span_id, service_name, scope_name, operation_name, kind,
@@ -835,7 +840,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				return
 			}
 			const transaction = db.transaction(() => {
-				for (const traceId of new Set(rows.map((row) => row.trace_id))) upsertTraceSummary.run(traceId)
+				for (const traceId of new Set(rows.map((row) => row.trace_id))) {
+					// Ingest updates existing summaries transactionally. Rebuilding them on every
+					// maintenance tick repeatedly scans large traces and delays unrelated writes.
+					if (!evictingTrace?.get(traceId) && !db.query("SELECT 1 FROM trace_summaries WHERE trace_id = ?").get(traceId)) upsertTraceSummary.run(traceId)
+				}
 				db.query(`INSERT OR REPLACE INTO motel_maintenance(key, value) VALUES ('trace_summary_cursor', ?)`).run(String(rows.at(-1)!.rowid))
 			})
 			transaction()
@@ -868,7 +877,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			if (operations.length === 1) {
 				const [traceId, spanId, operationName] = operations[0]!
 				deleteSpanOperationSearch.run(traceId, spanId)
-				insertSpanOperationSearch.run(traceId, spanId, operationName)
+				db.query("DELETE FROM span_search_rows WHERE trace_id = ? AND span_id = ?").run(traceId, spanId)
+				const result = insertSpanOperationSearch.run(traceId, spanId, operationName)
+				mapSpanSearch?.run(Number(result.lastInsertRowid), traceId, spanId)
 				return
 			}
 
@@ -878,13 +889,17 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				deleteSpanOperationSearchManyByCount.set(operations.length, deleteQuery)
 			}
 			deleteQuery.run(...operations.flatMap(([traceId, spanId]) => [traceId, spanId]))
+			for (const [traceId, spanId] of operations) db.query("DELETE FROM span_search_rows WHERE trace_id = ? AND span_id = ?").run(traceId, spanId)
 
 			let insertQuery = insertSpanOperationSearchManyByCount.get(operations.length)
 			if (!insertQuery) {
 				insertQuery = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES ${operations.map(() => "(?, ?, ?)").join(", ")}`)
 				insertSpanOperationSearchManyByCount.set(operations.length, insertQuery)
 			}
-			insertQuery.run(...operations.flatMap(([traceId, spanId, operationName]) => [traceId, spanId, operationName]))
+			const result = insertQuery.run(...operations.flatMap(([traceId, spanId, operationName]) => [traceId, spanId, operationName]))
+			// FTS allocates consecutive rowids within this trigger-free multi-row INSERT.
+			const firstId = Number(result.lastInsertRowid) - operations.length + 1
+			for (const [index, [traceId, spanId]] of operations.entries()) mapSpanSearch?.run(firstId + index, traceId, spanId)
 		}
 		const insertLogAttribute = db.query(`INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`)
 		const logAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
@@ -909,7 +924,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			if (entries.length === 0) return
 			if (entries.length === 1) {
 				const [logId, body] = entries[0]!
-				insertLogBodySearch.run(logId, body)
+				const result = insertLogBodySearch.run(logId, body)
+				mapLogSearch?.run(Number(result.lastInsertRowid), Number(logId))
 				return
 			}
 			let query = insertLogBodySearchManyByCount.get(entries.length)
@@ -917,35 +933,12 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				query = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES ${entries.map(() => "(?, ?)").join(", ")}`)
 				insertLogBodySearchManyByCount.set(entries.length, query)
 			}
-			query.run(...entries.flatMap(([logId, body]) => [logId, body]))
+			const result = query.run(...entries.flatMap(([logId, body]) => [logId, body]))
+			const firstId = Number(result.lastInsertRowid) - entries.length + 1
+			for (const [index, [logId]] of entries.entries()) mapLogSearch?.run(firstId + index, Number(logId))
 		}
 
 		const maxDbSizeBytes = config.otel.maxDbSizeMb * 1024 * 1024
-
-		// Freelist-ratio thresholds for the adaptive reclaim loop. Below the
-		// LOW threshold there's nothing worth doing; above HIGH we are in the
-		// 17GB-DB-with-10GB-freelist failure mode and need to reclaim aggressively
-		// even if it costs writer-lock time.
-		const FREELIST_LOW_RATIO = 0.05
-		const FREELIST_MID_RATIO = 0.20
-		const FREELIST_HIGH_RATIO = 0.50
-		const VACUUM_PAGES_NORMAL = 2000     // ~8MB/pass
-		const VACUUM_PAGES_BUSY = 20000      // ~80MB/pass — used when freelist > 20%
-		const VACUUM_PAGES_PANIC = 50000     // ~200MB/pass — only when ratio > 50%
-
-		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
-
-		const incrementalFtsMerge = (pages: number) => {
-			// FTS5 segment merges drop tombstone rows that DELETE leaves behind.
-			// Without periodic merges, deleted FTS rows stay on disk indefinitely
-			// — a major source of freelist pages on a heavy-deletion workload.
-			// `merge=N` is a bounded, online operation: it merges at most N
-			// pages of work and returns. Per FTS5 docs, missing tables silently
-			// throw; we swallow because not every DB has every FTS table.
-			for (const name of ftsTableNames) {
-				try { db.query(`INSERT INTO ${name}(${name}) VALUES (?)`).run(`merge=${pages}`) } catch { /* table absent or older schema */ }
-			}
-		}
 
 		const publishDiagnostic = yield* WriterDiagnostics
 		const observeMaintenance = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
@@ -957,131 +950,36 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				}))))
 			})
 
+		const checkpoint = () => {
+			const value = checkpointPassive(db)
+			publishDiagnostic({ _tag: "checkpoint", value })
+			return value
+		}
 		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
 			yield* Effect.sync(() => {
-				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
-				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
-				if (pageCount === 0) return
-				const ratio = freePages / pageCount
-				if (ratio < FREELIST_LOW_RATIO) return
-
-				// Adaptive vacuum sizing — fixed 2000 pages/min could not keep
-				// up with sustained deletions, leaking 10GB of freelist over
-				// time. Scale the per-pass work to the size of the backlog so
-				// we stay roughly proportional to the deficit.
-				const pages =
-					ratio >= FREELIST_HIGH_RATIO ? VACUUM_PAGES_PANIC :
-					ratio >= FREELIST_MID_RATIO ? VACUUM_PAGES_BUSY :
-					VACUUM_PAGES_NORMAL
-
-				try { db.exec(`PRAGMA incremental_vacuum(${pages});`) } catch { /* ignore */ }
-
-				// In WAL mode incremental_vacuum only moves pages — the file
-				// shrinks on the next checkpoint. PASSIVE silently skips when
-				// readers are active (the failure mode the agent's research
-				// flagged: checkpoint starvation). Use RESTART normally and
-				// TRUNCATE in panic mode to physically shrink the WAL when it
-				// has grown.
-				const mode = ratio >= FREELIST_HIGH_RATIO ? "TRUNCATE" : "RESTART"
-				try { db.exec(`PRAGMA wal_checkpoint(${mode});`) } catch { /* ignore */ }
+				// Never wait out busy_timeout for a WAL reader. Defer physical reclaim until
+				// all frames are checkpointed; a held snapshot can grow WAL beyond size_limit.
+				if (checkpoint().deferred) return
+				const freePages = (db.query("PRAGMA freelist_count").get() as { freelist_count: number }).freelist_count
+				if (freePages > 0) db.exec("PRAGMA incremental_vacuum(256)")
 			})
 		})
 
+		let maintenancePending = false
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
-
 			yield* Effect.sync(() => {
-				const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
-
-				// Evict at TRACE granularity so we never leave a trace half-gutted
-				// (previous logic deleted oldest 20% of spans, which happily sliced
-				// across traces and corrupted the summary rebuild). Running traces
-				// are protected — only `active_span_count = 0` summaries are in
-				// scope for eviction.
-				const toEvict = new Set<string>()
-
-				// Time-based: completed traces whose last span ended before cutoff.
-				const timeExpired = db.query(
-					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ? ORDER BY ended_at_ms ASC LIMIT ?`,
-				).all(cutoff, config.otel.retentionTraceBatch) as readonly { trace_id: string }[]
-				for (const row of timeExpired) toEvict.add(row.trace_id)
-
-				// Size-based: if actual data exceeds the target, drop one bounded
-				// batch of the oldest completed traces. `(page_count - freelist_count)`
-				// ignores freed-but-not-vacuumed pages so a large freelist doesn't
-				// trigger a deletion death spiral.
-				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
-				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
-				const pageSize = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
-				const dbSize = (pageCount - freePages) * pageSize
-				if (dbSize > maxDbSizeBytes) {
-					const oldest = db.query(
-						`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
-					).all(config.otel.retentionTraceBatch) as readonly { trace_id: string }[]
-					// Set.add dedupes overlap with the time-expired batch above.
-					for (const row of oldest) toEvict.add(row.trace_id)
-				}
-
-				// Logs have their own retention boundary. A correlated log may refer
-				// to a trace that was sampled elsewhere or never reached Motel, so
-				// tying log eviction to trace_summaries lets those rows grow forever.
-				const expiredLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp_ms < ? ORDER BY timestamp_ms ASC LIMIT ?)`).run(cutoff, config.otel.retentionLogBatch)
-				let deletedLogs = Number(expiredLogs.changes) > 0
-				if (dbSize > maxDbSizeBytes) {
-					const oversizedLogs = db.query(`DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY timestamp_ms ASC LIMIT ?)`).run(config.otel.retentionLogBatch)
-					deletedLogs = deletedLogs || Number(oversizedLogs.changes) > 0
-				}
-
-				// Batch the trace-id list so the IN placeholders stay under
-				// SQLite's default limit (~999). Each batch wipes every row
-				// reachable from those trace_ids across the cascade tables.
-				const traceIds = Array.from(toEvict)
-				const BATCH_SIZE = 500
-				for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
-					const batch = traceIds.slice(offset, offset + BATCH_SIZE)
-					const placeholders = batch.map(() => "?").join(",")
-					db.query(`DELETE FROM span_attributes WHERE trace_id IN (${placeholders})`).run(...batch)
-					try {
-						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN (${placeholders})`).run(...batch)
-					} catch {
-						// FTS table may not exist on old DBs.
-					}
-					db.query(`DELETE FROM spans WHERE trace_id IN (${placeholders})`).run(...batch)
-					db.query(`DELETE FROM logs WHERE trace_id IN (${placeholders})`).run(...batch)
-					db.query(`DELETE FROM trace_summaries WHERE trace_id IN (${placeholders})`).run(...batch)
-				}
-
-				// Log-side orphans (log_attributes + FTS) are keyed by log.id,
-				// so prune what no longer has a parent log row.
-				const orphanAttributes = db.query(`DELETE FROM log_attributes WHERE rowid IN (SELECT log_attributes.rowid FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id) LIMIT ?)`).run(config.otel.retentionLogBatch)
-				let deletedOrphans = Number(orphanAttributes.changes) > 0
-				try {
-					const orphanFts = db.query(`DELETE FROM log_body_fts WHERE rowid IN (SELECT rowid FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER)) LIMIT ?)`).run(config.otel.retentionLogBatch)
-					deletedOrphans = deletedOrphans || Number(orphanFts.changes) > 0
-				} catch {
-					// FTS table may not exist on old DBs.
-				}
-
-				// Checkpoint after a big delete pass so the freed pages land
-				// in the main DB file and become eligible for incremental
-				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
-				// when readers are active, which is the documented mechanism
-				// behind WAL/freelist starvation when ingest is busy.
-				if (toEvict.size === 0 && !deletedLogs && !deletedOrphans) return
-				try { db.exec(`PRAGMA wal_checkpoint(RESTART);`) } catch { /* ignore */ }
-
-				// Incremental FTS5 merge — DELETE on an FTS5-indexed row
-				// leaves a tombstone in the segment tree that only `merge`
-				// reclaims. Skipping this is the second compounding cause
-				// (after fixed-size vacuum) of the slow freelist accretion
-				// that took the DB to 17GB. 100 pages of merge work per
-				// retention tick is bounded and runs in milliseconds.
-				incrementalFtsMerge(100)
-
-				// Actual page reclamation lives in `reclaimSpace`, which
-				// runs on its own faster cadence so the file shrinks even
-				// when no traces are evicted in a given retention tick (e.g.
-				// after a large historical eviction has already happened).
+				const result = retainBatch(db, {
+					cutoff: now - config.otel.retentionHours * 60 * 60 * 1000,
+					maxBytes: maxDbSizeBytes,
+					traces: config.otel.retentionTraceBatch,
+					logs: config.otel.retentionLogBatch,
+					rows: config.otel.retentionRowBatch,
+				})
+				maintenancePending = result.pending && result.rows > 0
+				repairSearchRows(db, Math.min(100, config.otel.retentionRowBatch))
+				mergeFts(db, 100)
+				checkpoint()
 			})
 		})
 
@@ -1089,18 +987,20 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		// the HTTP event loop and no second writer duplicates cleanup work.
 		if (opts.runRetention) {
 			// Cleanup runs on the telemetry worker, never the HTTP event loop.
-			yield* Effect.forkScoped(Effect.repeat(
-				observeMaintenance("retention", Effect.andThen(reconcileTraceSummaries, cleanupExpired())).pipe(Effect.catchCause((cause) => Effect.logWarning(`motel: maintenance pass failed: ${Cause.pretty(cause)}`))),
-				Schedule.spaced(`${config.otel.retentionIntervalSeconds} seconds`),
-			))
+			const retentionLoop: Effect.Effect<void> = Effect.suspend(() =>
+				observeMaintenance("retention", Effect.andThen(reconcileTraceSummaries, cleanupExpired())).pipe(
+					Effect.catchCause((cause) => {
+						maintenancePending = false
+						return Effect.logWarning(`motel: maintenance pass failed: ${Cause.pretty(cause)}`)
+					}),
+					Effect.andThen(Effect.suspend(() => Effect.sleep(maintenancePending ? "100 millis" : `${config.otel.retentionIntervalSeconds} seconds`))),
+					Effect.andThen(Effect.suspend(() => retentionLoop)),
+				),
+			)
+			yield* Effect.forkScoped(retentionLoop)
 
-			// Page reclamation runs on a separate, faster cadence (10s) and
-			// is independent of the eviction loop. The reason: a single sweep
-			// at 60s intervals can move only ~8MB of pages before the next
-			// burst of inserts grows the freelist again. Decoupling lets us
-			// catch up adaptively (see VACUUM_PAGES_BUSY/PANIC) without
-			// changing the cost of the heavier delete sweep.
-			yield* Effect.forkScoped(Effect.repeat(observeMaintenance("reclaim", reclaimSpace()), Schedule.spaced("10 seconds")))
+			// Physical reclamation has a small fixed page budget and defers for readers.
+			yield* Effect.forkScoped(Effect.repeat(observeMaintenance("reclaim", reclaimSpace()).pipe(Effect.catchCause((cause) => Effect.logWarning(`motel: reclaim failed: ${Cause.pretty(cause)}`))), Schedule.spaced("10 seconds")))
 
 			// Periodically refresh query planner stats. `PRAGMA optimize` is a
 			// no-op when nothing has changed, so this is essentially free on idle
@@ -1174,7 +1074,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 							for (const span of scopeSpans.spans ?? []) {
 								const traceId = normalizeOtlpBinaryId(span.traceId, 16)
 								const spanId = normalizeOtlpBinaryId(span.spanId, 8)
-								if (!traceId || !spanId) continue
+								if (!traceId || !spanId || evictingTrace?.get(traceId)) continue
 								const parentSpanId = normalizeOtlpBinaryId(span.parentSpanId, 8)
 								const spanAttributes = attributeMap(span.attributes)
 								const mergedAttributes = { ...resourceAttributes, ...spanAttributes }
@@ -1247,8 +1147,10 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 								const body = stringifyValue(parseAnyValue(record.body))
 								const rawTraceId = attributes.traceId || attributes.trace_id || record.traceId || null
 								const rawSpanId = attributes.spanId || attributes.span_id || record.spanId || null
+								const traceId = normalizeOtlpBinaryId(rawTraceId, 16)
+								if (traceId && evictingTrace?.get(traceId)) continue
 								const result = insertLog.run(
-									normalizeOtlpBinaryId(rawTraceId, 16),
+									traceId,
 									normalizeOtlpBinaryId(rawSpanId, 8),
 									serviceName,
 									scopeName,
@@ -1287,9 +1189,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// long-running trace can emit a current child after its root ages
 				// outside the lookback window.
 				const rows = db.query(`
-					SELECT service_name FROM spans WHERE start_time_ms >= ?
+					SELECT service_name FROM ${spanSource} WHERE start_time_ms >= ?
 					UNION
-					SELECT service_name FROM logs WHERE timestamp_ms >= ?
+					SELECT service_name FROM ${logSource} WHERE timestamp_ms >= ?
 					ORDER BY service_name ASC
 				`).all(cutoff, cutoff) as Array<{ service_name: string }>
 				return rows.map((row) => row.service_name)
@@ -1302,7 +1204,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			if (traceIds.length === 0) return [] as readonly TraceItem[]
 			const placeholders = traceIds.map(() => "?").join(", ")
 			const rows = db.query(`
-				SELECT * FROM spans
+				SELECT * FROM ${spanSource}
 				WHERE trace_id IN (${placeholders})
 				ORDER BY start_time_ms ASC
 			`).all(...traceIds) as SpanRow[]
@@ -1349,7 +1251,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				return db.query(`
 					SELECT trace_id, service_name, root_operation_name, started_at_ms, ended_at_ms, active_span_count, duration_ms, span_count, error_count
-					FROM trace_summaries
+					FROM ${traceSource}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY started_at_ms DESC, trace_id DESC
 					LIMIT ?
@@ -1392,7 +1294,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM span_operation_fts WHERE span_operation_fts MATCH ?)")
 						params.push(ftsQuery)
 					} else {
-						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM spans WHERE operation_name LIKE ? COLLATE NOCASE)")
+						clauses.push(`trace_id IN (SELECT DISTINCT trace_id FROM ${spanSource} WHERE operation_name LIKE ? COLLATE NOCASE)`)
 						params.push(`%${input.operation}%`)
 					}
 				}
@@ -1424,7 +1326,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				const rows = db.query(`
 					SELECT trace_id, service_name, root_operation_name, started_at_ms, ended_at_ms, active_span_count, duration_ms, span_count, error_count
-					FROM trace_summaries
+					FROM ${traceSource}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY started_at_ms DESC, trace_id DESC
 					LIMIT ?
@@ -1438,7 +1340,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			yield* Effect.annotateCurrentSpan("trace.trace_id", traceId)
 			return yield* Effect.sync(() => {
 				const rows = db.query(`
-					SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time_ms ASC
+					SELECT * FROM ${spanSource} WHERE trace_id = ? ORDER BY start_time_ms ASC
 				`).all(traceId) as SpanRow[]
 				return rows.length === 0 ? null : buildTrace(traceId, rows)
 			})
@@ -1448,7 +1350,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			yield* Effect.annotateCurrentSpan("trace.span_id", spanId)
 			return yield* Effect.sync(() => {
 				// Fetch only the target span row (uses idx_spans_span_id)
-				const spanRow = db.query(`SELECT * FROM spans WHERE span_id = ? LIMIT 1`).get(spanId) as SpanRow | null
+				const spanRow = db.query(`SELECT * FROM ${spanSource} WHERE span_id = ? LIMIT 1`).get(spanId) as SpanRow | null
 				if (!spanRow) return null
 
 				const traceId = spanRow.trace_id
@@ -1462,11 +1364,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					const ancestors = db.query(`
 						WITH RECURSIVE ancestors(span_id, parent_span_id, operation_name, hop) AS (
 							SELECT span_id, parent_span_id, operation_name, 1
-							FROM spans WHERE trace_id = ? AND span_id = ?
+							FROM ${spanSource} WHERE trace_id = ? AND span_id = ?
 							UNION ALL
 							SELECT s.span_id, s.parent_span_id, s.operation_name, a.hop + 1
 							FROM ancestors a
-							JOIN spans s ON s.trace_id = ? AND s.span_id = a.parent_span_id
+							JOIN ${spanSource} s ON s.trace_id = ? AND s.span_id = a.parent_span_id
 						)
 						SELECT span_id, parent_span_id, operation_name, hop FROM ancestors ORDER BY hop ASC
 					`).all(traceId, spanRow.parent_span_id, traceId) as Array<{ span_id: string; parent_span_id: string | null; operation_name: string; hop: number }>
@@ -1476,7 +1378,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				}
 
 				const rootRow = db.query(`
-					SELECT operation_name FROM spans
+					SELECT operation_name FROM ${spanSource}
 					WHERE trace_id = ? AND parent_span_id IS NULL
 					ORDER BY start_time_ms ASC LIMIT 1
 				`).get(traceId) as { operation_name: string } | null
@@ -1494,7 +1396,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 		const listTraceSpans = Effect.fn("motel/TelemetryStore.listTraceSpans")(function* (traceId: string) {
 			return yield* Effect.sync(() => {
-				const rows = db.query(`SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time_ms ASC`).all(traceId) as SpanRow[]
+				const rows = db.query(`SELECT * FROM ${spanSource} WHERE trace_id = ? ORDER BY start_time_ms ASC`).all(traceId) as SpanRow[]
 				return rows.length === 0 ? [] as readonly SpanItem[] : buildSpanItems(traceId, rows)
 			})
 		})
@@ -1519,7 +1421,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// to drive the parent-context lookup. Parsing the heavy
 				// `*_json` blobs is deferred until after we've sliced down
 				// to the final `limit`.
-				let fromSql = "FROM spans AS s"
+				let fromSql = `FROM ${spanSource} AS s`
 				const joinParams: Array<string | number> = []
 				const clauses: string[] = ["s.start_time_ms >= ?"]
 				const params: Array<string | number> = [cutoff]
@@ -1580,7 +1482,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				const placeholders = traceIds.map(() => "?").join(", ")
 				const allSpanRows = db.query(`
 					SELECT trace_id, span_id, parent_span_id, operation_name, start_time_ms
-					FROM spans
+					FROM ${spanSource}
 					WHERE trace_id IN (${placeholders})
 				`).all(...traceIds) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number }>
 
@@ -1636,7 +1538,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// sees the same ordering the candidate scan produced.
 				const keptValues = filteredLite.map(() => "(?, ?)").join(", ")
 				const fullRows = db.query(`
-					SELECT * FROM spans WHERE (trace_id, span_id) IN (VALUES ${keptValues})
+					SELECT * FROM ${spanSource} WHERE (trace_id, span_id) IN (VALUES ${keptValues})
 				`).all(...filteredLite.flatMap((row) => [row.trace_id, row.span_id])) as SpanRow[]
 				const fullRowByKey = new Map<string, SpanRow>()
 				for (const row of fullRows) {
@@ -1729,7 +1631,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""
 				const limit = input.limit ?? config.otel.logFetchLimit
 				const rows = db.query(`
-					SELECT * FROM logs
+					SELECT * FROM ${logSource}
 					${where}
 					ORDER BY timestamp_ms DESC, id DESC
 					LIMIT ?
@@ -1843,7 +1745,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				if (input.agg === "p95_duration") {
 					const rows = db.query(`
 						SELECT ${groupExpr} AS grp, duration_ms
-						FROM trace_summaries
+						FROM ${traceSource}
 						WHERE ${whereClauses.join(" AND ")}
 					`).all(...whereParams) as Array<{ grp: string; duration_ms: number }>
 
@@ -1862,7 +1764,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				const rows = db.query(`
 					SELECT ${groupExpr} AS grp, ${aggExpr} AS value, COUNT(*) AS count
-					FROM trace_summaries
+					FROM ${traceSource}
 					WHERE ${whereClauses.join(" AND ")}
 					GROUP BY grp
 					ORDER BY value DESC
@@ -1949,7 +1851,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				const rows = db.query(`
 					SELECT ${groupExpr} AS grp, COUNT(*) AS count
-					FROM logs
+					FROM ${logSource}
 					${where}
 					GROUP BY grp
 					ORDER BY count DESC
@@ -1976,7 +1878,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "service") {
 						const rows = db.query(`
 							SELECT service_name AS value, COUNT(*) AS count
-							FROM logs
+							FROM ${logSource}
 							WHERE timestamp_ms >= ?
 							GROUP BY service_name
 							ORDER BY count DESC, value ASC
@@ -1987,7 +1889,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "severity") {
 						const rows = db.query(`
 							SELECT UPPER(severity_text) AS value, COUNT(*) AS count
-							FROM logs
+							FROM ${logSource}
 							WHERE timestamp_ms >= ?
 							${input.serviceName ? "AND service_name = ?" : ""}
 							GROUP BY value
@@ -1999,7 +1901,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "scope") {
 						const rows = db.query(`
 							SELECT COALESCE(scope_name, 'unknown') AS value, COUNT(*) AS count
-							FROM logs
+							FROM ${logSource}
 							WHERE timestamp_ms >= ?
 							${input.serviceName ? "AND service_name = ?" : ""}
 							GROUP BY COALESCE(scope_name, 'unknown')
@@ -2014,7 +1916,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "service") {
 						const rows = db.query(`
 							SELECT service_name AS value, COUNT(*) AS count
-							FROM trace_summaries
+							FROM ${traceSource}
 							WHERE started_at_ms >= ?
 							GROUP BY service_name
 							ORDER BY count DESC, value ASC
@@ -2025,7 +1927,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "operation") {
 						const rows = db.query(`
 							SELECT root_operation_name AS value, COUNT(*) AS count
-							FROM trace_summaries
+							FROM ${traceSource}
 							WHERE started_at_ms >= ?
 							${input.serviceName ? "AND service_name = ?" : ""}
 							GROUP BY root_operation_name
@@ -2037,7 +1939,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					if (input.field === "status") {
 						const rows = db.query(`
 							SELECT CASE WHEN error_count > 0 THEN 'error' ELSE 'ok' END AS value, COUNT(*) AS count
-							FROM trace_summaries
+							FROM ${traceSource}
 							WHERE started_at_ms >= ?
 							${input.serviceName ? "AND service_name = ?" : ""}
 							GROUP BY value
@@ -2066,10 +1968,10 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						const params: Array<string | number> = []
 						let traceFilter: string
 						if (input.serviceName) {
-							traceFilter = `(SELECT trace_id FROM trace_summaries WHERE started_at_ms >= ? AND service_name = ?)`
+							traceFilter = `(SELECT trace_id FROM ${traceSource} WHERE started_at_ms >= ? AND service_name = ?)`
 							params.push(cutoff, input.serviceName)
 						} else {
-							traceFilter = `(SELECT trace_id FROM trace_summaries WHERE started_at_ms >= ?)`
+							traceFilter = `(SELECT trace_id FROM ${traceSource} WHERE started_at_ms >= ?)`
 							params.push(cutoff)
 						}
 						params.push(FACET_VALUE_MAX_LEN, limit)
@@ -2100,7 +2002,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						const rows = db.query(`
 							SELECT sa.value AS value, COUNT(DISTINCT sa.trace_id) AS count
 							FROM span_attributes sa
-							JOIN spans s ON s.trace_id = sa.trace_id AND s.span_id = sa.span_id
+							JOIN ${spanSource} s ON s.trace_id = sa.trace_id AND s.span_id = sa.span_id
 							WHERE sa.key = ? AND LENGTH(sa.value) < ?
 							  AND s.start_time_ms >= ?
 							${input.serviceName ? "AND s.service_name = ?" : ""}
@@ -2237,7 +2139,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				const rows = db.query(`
 					SELECT s.trace_id, s.span_id, s.service_name, s.operation_name, s.start_time_ms, s.duration_ms, s.status
-					FROM spans AS s
+					FROM ${spanSource} AS s
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY s.start_time_ms DESC
 					LIMIT ?
@@ -2263,7 +2165,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				const spanParams = rows.flatMap((r) => [r.trace_id, r.span_id])
 				const toolCountRows = db.query(`
 					SELECT parent_span_id, COUNT(*) AS cnt
-					FROM spans
+					FROM ${spanSource}
 					WHERE (trace_id, parent_span_id) IN (VALUES ${spanPlaceholders})
 					AND operation_name LIKE 'ai.toolCall%'
 					GROUP BY trace_id, parent_span_id
@@ -2313,7 +2215,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		const getAiCall = Effect.fn("motel/TelemetryStore.getAiCall")(function* (spanId: string) {
 			return yield* Effect.sync(() => {
 				const row = db.query(`
-					SELECT * FROM spans WHERE span_id = ? AND operation_name LIKE 'ai.%' LIMIT 1
+					SELECT * FROM ${spanSource} WHERE span_id = ? AND operation_name LIKE 'ai.%' LIMIT 1
 				`).get(spanId) as SpanRow | null
 				if (!row) return null
 
@@ -2332,7 +2234,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				// Load tool call child spans
 				const toolCallRows = db.query(`
 					SELECT span_id, operation_name, duration_ms, status, attributes_json
-					FROM spans
+					FROM ${spanSource}
 					WHERE trace_id = ? AND parent_span_id = ? AND operation_name LIKE 'ai.toolCall%'
 					ORDER BY start_time_ms ASC
 				`).all(row.trace_id, row.span_id) as SpanRow[]
@@ -2349,7 +2251,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				// Load correlated logs
 				const logRows = db.query(`
-					SELECT * FROM logs WHERE span_id = ? ORDER BY timestamp_ms ASC
+					SELECT * FROM ${logSource} WHERE span_id = ? ORDER BY timestamp_ms ASC
 				`).all(row.span_id) as LogRow[]
 				const logs = logRows.map(parseLogRow)
 
@@ -2421,7 +2323,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				if (input.groupBy === "status") {
 					const rows = db.query(`
 						SELECT s.status AS grp, COUNT(*) AS count, AVG(s.duration_ms) AS avg_dur
-						FROM spans AS s
+						FROM ${spanSource} AS s
 						WHERE ${clauses.join(" AND ")}
 						GROUP BY s.status
 						ORDER BY count DESC
@@ -2448,7 +2350,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						s.span_id,
 						s.duration_ms,
 						s.status
-					FROM spans AS s
+					FROM ${spanSource} AS s
 					LEFT JOIN span_attributes AS ga
 						ON ga.trace_id = s.trace_id AND ga.span_id = s.span_id AND ga.key = ?
 					WHERE ${clauses.join(" AND ")}

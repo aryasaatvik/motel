@@ -1,5 +1,9 @@
 import { Context, Schema } from "effect"
 
+const Checkpoint = Schema.Struct({
+	busy: Schema.Number, log: Schema.Number, checkpointed: Schema.Number, deferred: Schema.Boolean,
+})
+
 const Maintenance = Schema.Struct({
 	operation: Schema.String,
 	startedAt: Schema.Number,
@@ -16,11 +20,13 @@ export const IngestReadiness = Schema.Struct({
 	lastCommitAt: Schema.NullOr(Schema.Number),
 	committedRecords: Schema.Number,
 	maintenance: Schema.NullOr(Maintenance),
+	checkpoint: Schema.NullOr(Checkpoint),
 })
 export type IngestReadiness = typeof IngestReadiness.Type
 
 export const WriterEvent = Schema.TaggedUnion({
 	ready: {},
+	checkpoint: { value: Checkpoint },
 	commit: { records: Schema.Number, at: Schema.Number },
 	maintenance: { value: Maintenance },
 })
@@ -38,6 +44,7 @@ export class IngestProgress {
 	private readonly requests = new Map<symbol, { at: number; bytes: number }>()
 	private lastCommitAt: number | null = null
 	private committedRecords = 0
+	private checkpoint: IngestReadiness["checkpoint"] = null
 	private maintenance: IngestReadiness["maintenance"] = null
 	private readonly activeMaintenance = new Map<string, NonNullable<IngestReadiness["maintenance"]>>()
 
@@ -51,6 +58,7 @@ export class IngestProgress {
 
 	receive(event: WriterEvent) {
 		switch (event._tag) {
+			case "checkpoint": this.checkpoint = event.value; break
 			case "ready": this.ready = true; break
 			case "commit":
 				if (event.records > 0) {
@@ -86,6 +94,7 @@ export class IngestProgress {
 			lastCommitAt: this.lastCommitAt,
 			committedRecords: this.committedRecords,
 			maintenance: [...this.activeMaintenance.values()].sort((a, b) => a.startedAt - b.startedAt)[0] ?? this.maintenance,
+			checkpoint: this.checkpoint,
 		}
 	}
 }

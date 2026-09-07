@@ -326,6 +326,39 @@ describe("motel telemetry store", () => {
 		}
 	})
 
+	it("evicting traces stay hidden across public queries and reject late arrivals until cleanup completes", async () => {
+		const now = String(BigInt(Date.now()) * 1_000_000n)
+		const traceId = "eviction-visibility"
+		const trace = { resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "eviction-only" } }] }, scopeSpans: [{ spans: [{ traceId, spanId: "eviction-span", name: "ai.generateText", startTimeUnixNano: now, endTimeUnixNano: now }] }] }] }
+		const log = { resourceLogs: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "eviction-only" } }] }, scopeLogs: [{ logRecords: [{ traceId, spanId: "eviction-span", timeUnixNano: now, body: { stringValue: "hidden log" } }] }] }] }
+		await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			yield* store.ingestTraces(trace)
+			yield* store.ingestLogs(log)
+			const probe = new Database(dbPath)
+			try {
+				probe.query("INSERT INTO retention_traces VALUES (?)").run(traceId)
+				expect(yield* store.ingestTraces(trace)).toEqual({ insertedSpans: 0 })
+				expect(yield* store.ingestLogs(log)).toEqual({ insertedLogs: 0 })
+				expect(yield* store.searchSpans({ traceId })).toEqual([])
+				expect(yield* store.searchLogs({ traceId })).toEqual([])
+				expect(yield* store.searchTraces({ serviceName: "eviction-only" })).toEqual([])
+				expect(yield* store.searchAiCalls({ service: "eviction-only" })).toEqual([])
+				expect(yield* store.listServices).not.toContain("eviction-only")
+				expect(yield* store.getSpan("eviction-span")).toBeNull()
+				expect(yield* store.listFacets({ type: "traces", field: "service" })).not.toContainEqual({ value: "eviction-only", count: 1 })
+				yield* store.runRetentionNow
+				yield* store.runRetentionNow
+				expect(probe.query("SELECT 1 FROM retention_traces WHERE trace_id = ?").get(traceId)).toBeNull()
+				// Once deletion is complete, a later export can start a fresh trace as before.
+				expect(yield* store.ingestTraces(trace)).toEqual({ insertedSpans: 1 })
+				probe.query("INSERT INTO retention_traces VALUES (?)").run(traceId)
+				yield* store.runRetentionNow
+				yield* store.runRetentionNow
+			} finally { probe.close() }
+		}))
+	})
+
 	it("retention cleans orphan log indexes even when no logs are deleted", async () => {
 		const probe = new Database(dbPath)
 		try {
@@ -722,7 +755,7 @@ describe("motel telemetry store", () => {
 					WHERE severity_text = ? COLLATE NOCASE AND timestamp_ms >= ?
 					ORDER BY timestamp_ms DESC, id DESC LIMIT ?
 				`).all("INFO", 0, 80)
-				expect(plan.some((row) => row.detail.includes("idx_logs_severity_nocase_time (severity_text=?"))).toBe(true)
+				expect(plan.some((row) => row.detail.includes("idx_logs_severity_nocase_cursor (severity_text=?"))).toBe(true)
 			} finally {
 				probe.close()
 			}
