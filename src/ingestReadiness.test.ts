@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite"
 import { expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect } from "effect"
@@ -98,6 +98,63 @@ test("a writer bootstrap failure is reported without mistaking liveness for read
 		await Promise.race([child.exited, sleep(1000)])
 		if (child.exitCode === null) child.kill("SIGKILL")
 		await child.exited
+		rmSync(root, { recursive: true, force: true })
+	}
+}, 15000)
+
+
+test("completed maintenance cannot hide another operation that is still running", () => {
+	const progress = new IngestProgress()
+	progress.receive({ _tag: "maintenance", value: { operation: "retention", startedAt: 10, durationMs: null, outcome: "running" } })
+	progress.receive({ _tag: "maintenance", value: { operation: "reclaim", startedAt: 20, durationMs: null, outcome: "running" } })
+	progress.receive({ _tag: "maintenance", value: { operation: "reclaim", startedAt: 20, durationMs: 5, outcome: "completed" } })
+	expect(progress.snapshot().maintenance).toMatchObject({ operation: "retention", outcome: "running" })
+	progress.receive({ _tag: "maintenance", value: { operation: "retention", startedAt: 10, durationMs: 30, outcome: "completed" } })
+	expect(progress.snapshot().maintenance).toMatchObject({ operation: "retention", outcome: "completed", durationMs: 30 })
+})
+
+test("simultaneous cold starts from different workdirs converge on one managed daemon", async () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-concurrent-start-"))
+	const workdirs = [join(root, "a"), join(root, "b")]
+	for (const workdir of workdirs) mkdirSync(workdir)
+	const port = 36000 + Math.floor(Math.random() * 1000)
+	const managers = workdirs.map((workdir) => createDaemonManager({ runtimeDir: root, databasePath: join(root, "db.sqlite"), port, workdir, startTimeoutMs: 5000, gracefulStopTimeoutMs: 500, forceStopTimeoutMs: 500 }))
+	try {
+		const states = await Promise.all(managers.map((manager) => Effect.runPromise(manager.ensure)))
+		expect(states.every((state) => state.running && state.managed)).toBe(true)
+		expect(states[0]!.pid).toBe(states[1]!.pid)
+	} finally {
+		await Effect.runPromise(managers[0]!.stop)
+		rmSync(root, { recursive: true, force: true })
+	}
+}, 30000)
+
+test("ensure preserves a live daemon when its ingest readiness budget expires", async () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-busy-ensure-"))
+	const databasePath = join(root, "db.sqlite")
+	const port = 37000 + Math.floor(Math.random() * 1000)
+	const manager = createDaemonManager({ runtimeDir: root, databasePath, port })
+	const impatient = createDaemonManager({ runtimeDir: root, databasePath, port, startTimeoutMs: 150 })
+	let lock: Database | undefined
+	try {
+		const started = await Effect.runPromise(manager.ensure)
+		lock = new Database(databasePath)
+		lock.exec("BEGIN IMMEDIATE")
+		const write = fetch(`http://127.0.0.1:${port}/v1/logs`, {
+			method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: { stringValue: "blocked writer" } }] }] }] }),
+		})
+		await sleep(30)
+		await expect(Effect.runPromise(impatient.ensure)).rejects.toThrow("process was preserved")
+		const health = await (await fetch(`http://127.0.0.1:${port}/api/health`)).json() as { pid: number }
+		expect(started.pid).toBe(health.pid)
+		lock.exec("ROLLBACK")
+		expect((await write).status).toBe(200)
+		expect((await Effect.runPromise(manager.ensure)).pid).toBe(started.pid)
+	} finally {
+		try { lock?.exec("ROLLBACK") } catch {}
+		lock?.close()
+		await Effect.runPromise(manager.stop)
 		rmSync(root, { recursive: true, force: true })
 	}
 }, 15000)

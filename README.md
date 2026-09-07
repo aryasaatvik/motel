@@ -154,3 +154,8 @@ Run `bun scripts/bench-shared-daemon.ts` for an isolated reduced-cap mixed workl
 `--1gib` for the representative capacity profile. Both create and remove their own database,
 include a held reader, and report request latency percentiles, failures, and database/WAL size.
 They never benchmark the shared machine-global database.
+
+Concurrent starts publish a complete shared lock atomically. Ensure operations preserve a live
+daemon when ingestion is slow; explicit operator recovery remains available through `motel restart`.
+An unreadable lock or interrupted stale-lock recovery fails closed and reports its path for inspection.
+When maintenance operations overlap, readiness shows the oldest active operation before a completed one.

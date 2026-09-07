@@ -39,6 +39,7 @@ export class IngestProgress {
 	private lastCommitAt: number | null = null
 	private committedRecords = 0
 	private maintenance: IngestReadiness["maintenance"] = null
+	private readonly activeMaintenance = new Map<string, NonNullable<IngestReadiness["maintenance"]>>()
 
 	begin(bytes: number, now = Date.now()) {
 		const id = Symbol()
@@ -57,7 +58,15 @@ export class IngestProgress {
 					this.committedRecords += event.records
 				}
 				break
-			case "maintenance": this.maintenance = event.value; break
+			case "maintenance": {
+				const value = event.value
+				if (value.outcome === "running") this.activeMaintenance.set(value.operation, value)
+				else {
+					if (this.activeMaintenance.get(value.operation)?.startedAt === value.startedAt) this.activeMaintenance.delete(value.operation)
+					this.maintenance = value
+				}
+				break
+			}
 		}
 	}
 
@@ -76,7 +85,7 @@ export class IngestProgress {
 			oldestRequestAgeMs,
 			lastCommitAt: this.lastCommitAt,
 			committedRecords: this.committedRecords,
-			maintenance: this.maintenance,
+			maintenance: [...this.activeMaintenance.values()].sort((a, b) => a.startedAt - b.startedAt)[0] ?? this.maintenance,
 		}
 	}
 }

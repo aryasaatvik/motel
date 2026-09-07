@@ -557,7 +557,7 @@ export const ServerLive = HttpRouter.serve(
 	// POSTs again on the next flush. This also shaves ~1 KB of header
 	// attributes off every ingest request that would have been written
 	// to the spans table as noise.
-	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/v1/traces", "/v1/logs"])),
+	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/api/readiness", "/v1/traces", "/v1/logs"])),
 	// The telemetry worker owns ingest, migrations, and bounded maintenance.
 	// The HTTP thread only opens an existing database read-only (or bootstraps
 	// a brand-new empty one), keeping health independent of writer work.
