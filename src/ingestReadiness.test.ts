@@ -68,3 +68,36 @@ test("cached readiness bypasses a blocked writer and acknowledgement follows com
 		rmSync(runtimeDir, { recursive: true, force: true })
 	}
 }, 30000)
+
+test("a writer bootstrap failure is reported without mistaking liveness for readiness", async () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-writer-failure-"))
+	const port = 35000 + Math.floor(Math.random() * 1000)
+	const child = Bun.spawn([process.execPath, "src/server.ts"], {
+		cwd: join(import.meta.dir, ".."),
+		env: { ...process.env, MOTEL_OTEL_DB_PATH: root, MOTEL_RUNTIME_DIR: root, MOTEL_OTEL_HOST: "127.0.0.1", MOTEL_OTEL_PORT: String(port), MOTEL_OTEL_BASE_URL: `http://127.0.0.1:${port}`, MOTEL_OTEL_ENABLED: "false" },
+		stdout: "ignore", stderr: "ignore",
+	})
+	try {
+		let state: string | undefined
+		const until = Date.now() + 10000
+		while (Date.now() < until) {
+			try {
+				const response = await fetch(`http://127.0.0.1:${port}/api/readiness`, { signal: AbortSignal.timeout(500) })
+				state = (await response.json() as IngestReadiness).state
+				if (state === "failed") {
+					expect(response.status).toBe(503)
+					break
+				}
+			} catch { /* Wait for the HTTP listener independently of writer bootstrap. */ }
+			await sleep(25)
+		}
+		expect(state).toBe("failed")
+		expect((await fetch(`http://127.0.0.1:${port}/api/health`)).status).toBe(200)
+	} finally {
+		child.kill("SIGTERM")
+		await Promise.race([child.exited, sleep(1000)])
+		if (child.exitCode === null) child.kill("SIGKILL")
+		await child.exited
+		rmSync(root, { recursive: true, force: true })
+	}
+}, 15000)

@@ -58,9 +58,10 @@ try {
 	db.exec("BEGIN")
 	db.query("SELECT count(*) FROM logs").get()
 	await request("logs", "/v1/logs", logs(0))
-	const started = performance.now()
+	const releaseReader = setTimeout(() => db.exec("ROLLBACK"), 5000)
 	try {
-		while (performance.now() - started < 15000) {
+		for (let round = 0; round < 30; round++) {
+			const started = performance.now()
 			await Promise.all([
 				...Array.from({ length: 4 }, (_, run) => request("logs", "/v1/logs", logs(run))),
 				request("traces", "/v1/traces", traces(0)),
@@ -69,8 +70,13 @@ try {
 				request("health", "/api/health"),
 				request("readiness", "/api/readiness"),
 			])
+			await new Promise((resolve) => setTimeout(resolve, Math.max(0, 250 - (performance.now() - started))))
 		}
-	} finally { db.exec("ROLLBACK"); db.close() }
+	} finally {
+		clearTimeout(releaseReader)
+		try { db.exec("ROLLBACK") } catch { /* The timed release already ended the snapshot. */ }
+		db.close()
+	}
 	const inspect = new Database(databasePath, { readonly: true })
 	const pages = inspect.query("PRAGMA page_count").get()
 	const free = inspect.query("PRAGMA freelist_count").get()
