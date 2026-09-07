@@ -1,3 +1,29 @@
+## @aryasaatvik/motel@0.4.0
+
+### Inspect ingestion readiness without waiting for SQLite
+
+`GET /api/readiness` and `motel status` expose cached writer startup, backlog, commit progress,
+and maintenance timing. Busy ingestion no longer needs another queued write to explain its
+state. OTLP responses still acknowledge only committed records.
+
+Concurrent cold starts now publish their shared startup lock atomically. Ensure operations
+preserve an existing live daemon when ingestion is slow or unavailable, and report operator
+diagnostics instead of restarting another worktree's writer.
+
+### Bound query backlog and cancel obsolete work
+
+Read-only queries now have bounded FIFO admission and deadlines, with explicit HTTP 503/504
+errors. Expired executing queries release their SQLite reader before subsequent work runs;
+ingestion keeps its own worker. The TUI coalesces refreshes and bounds facet prefetch, and
+span searches load only the ancestors of returned spans instead of whole traces.
+
+### Keep ingestion progressing during retention
+
+Routine checkpoints no longer wait for long-running readers, and readiness reports incomplete
+checkpoint progress. Retention hides completed traces atomically and removes their rows in
+bounded, recoverable batches. Active traces remain protected. FTS merging now runs correctly,
+and indexed deletion plus bounded legacy repair avoids repeated orphan-table scans.
+
 ## @aryasaatvik/motel@0.3.5
 
 ### Honor explicit services and normalize severity queries
