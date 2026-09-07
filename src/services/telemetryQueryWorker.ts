@@ -1,32 +1,31 @@
 import { BunRuntime } from "@effect/platform-bun"
-import * as BunWorkerRunner from "@effect/platform-bun/BunWorkerRunner"
-import { Effect, Layer } from "effect"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
+import { Effect, Schema } from "effect"
 import { TelemetryStoreQueryWorkerLive, TelemetryStoreReadonly, type TelemetryStoreReader } from "./TelemetryStore.js"
-import { QueryError, QueryRpcs } from "./queryRpc.js"
+import { QueryRequest, type QueryReply } from "./queryRpc.js"
 
-type QueryMethod = keyof TelemetryStoreReader
+const send = (reply: QueryReply) => postMessage(reply)
 
-const QueryHandlers = QueryRpcs.toLayer(Effect.gen(function*() {
+// This thread owns only a readonly SQLite connection. Its enclosing process is
+// retired on query deadlines; the ingestion worker is never part of that process.
+Effect.scoped(Effect.gen(function*() {
 	const store = yield* TelemetryStoreReadonly
-	return {
-		query: ({ method, args }) => {
-			const member = Reflect.get(store, method as QueryMethod) as unknown
-			const result = typeof member === "function" ? Reflect.apply(member, store, args) : member
-			return (result as Effect.Effect<unknown, Error>).pipe(
-				Effect.mapError((error) => new QueryError({ message: String(error) })),
-			)
-		},
+	let busy = false
+	const receive = ({ data }: MessageEvent<unknown>) => {
+		const request = Schema.decodeUnknownSync(QueryRequest)(data)
+		if (!Object.hasOwn(store, request.method) || busy) {
+			send({ _tag: "error", id: request.id, message: "Invalid or concurrent query request" })
+			return
+		}
+		busy = true
+		const member = store[request.method as keyof TelemetryStoreReader]
+		const result = typeof member === "function" ? Reflect.apply(member, store, request.args) : member
+		void Effect.runPromise(result as Effect.Effect<unknown, Error>).then(
+			(value) => { busy = false; send({ _tag: "result", id: request.id, value }) },
+			(error) => { busy = false; send({ _tag: "error", id: request.id, message: String(error) }) },
+		)
 	}
-}))
-
-const WorkerLive = RpcServer.layer(QueryRpcs).pipe(
-	Layer.provide(QueryHandlers),
-	Layer.provide(TelemetryStoreQueryWorkerLive),
-	Layer.provide(RpcServer.layerProtocolWorkerRunner),
-	Layer.provide(RpcSerialization.layerMsgPack),
-	Layer.provide(BunWorkerRunner.layer),
-)
-
-Layer.launch(WorkerLive).pipe(BunRuntime.runMain)
+	addEventListener("message", receive)
+	yield* Effect.addFinalizer(() => Effect.sync(() => removeEventListener("message", receive)))
+	send({ _tag: "ready" })
+	return yield* Effect.never
+})).pipe(Effect.provide(TelemetryStoreQueryWorkerLive), BunRuntime.runMain)

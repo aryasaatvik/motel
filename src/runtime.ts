@@ -5,7 +5,9 @@ import { SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs"
 import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base"
 import { Layer, ManagedRuntime } from "effect"
 import { config } from "./config.js"
-import { TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
+import { TelemetryStoreLive } from "./services/TelemetryStore.js"
+
+import { TelemetryQueryLive } from "./services/TelemetryQuery.js"
 
 const telemetryLayer = NodeSdk.layer(() => ({
 	spanProcessor: new SimpleSpanProcessor(
@@ -31,7 +33,7 @@ const telemetryLayer = NodeSdk.layer(() => ({
 // TUI-side runtime is readonly — a daemon/worker writer owns the DB
 // lock while ingests are in flight, and trying to grab the write lock
 // for schema init on startup causes "database is locked" on bun dev.
-const QueryRuntimeLive = config.otel.enabled ? Layer.mergeAll(TelemetryStoreReadonlyLive, telemetryLayer) : TelemetryStoreReadonlyLive
+const QueryRuntimeLive = config.otel.enabled ? Layer.mergeAll(TelemetryQueryLive, telemetryLayer) : TelemetryQueryLive
 
 export const queryRuntime = ManagedRuntime.make(QueryRuntimeLive)
 // `storeRuntime` is the full writer runtime, exposed for the telemetry

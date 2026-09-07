@@ -174,3 +174,15 @@ Routine checkpoints use PASSIVE and report busy/frame counts in readiness; physi
 is deferred for held readers. The configured database target and WAL size limit are not hard caps.
 Existing orphan attributes/FTS entries are repaired with bounded keyset scans; normal ingests
 maintain reverse FTS mappings for indexed cleanup.
+
+Queries use one readonly subprocess at a time, with FIFO admission capped at eight outstanding
+requests by default (`MOTEL_OTEL_QUERY_CAPACITY`, maximum 64). The five-second deadline includes
+queue and startup time (`MOTEL_OTEL_QUERY_DEADLINE_MS`, maximum 30000). Overload returns HTTP 503
+with `code: "QUERY_OVERLOADED"`; expiry returns 504 with `code: "QUERY_DEADLINE"`; process failure
+returns 503 with `code: "QUERY_UNAVAILABLE"`. Successful response shapes are unchanged.
+
+Cancelling or expiring an executing query terminates its readonly process and waits for exit
+before dispatching the next query. SQLite runs in a thread inside that process so an IPC-owner
+disconnect can also terminate it if the daemon or TUI dies. Ingestion owns a separate worker.
+The HTTP idle timeout exceeds the query deadline by five seconds. TUI refreshes share in-flight
+loads, obsolete selections discard results, and facet values prefetch sequentially for two keys.
