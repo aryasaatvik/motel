@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite"
 import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
 import { dirname } from "node:path"
 import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
+import { WriterDiagnostics } from "../ingestReadiness.ts"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
@@ -946,6 +947,16 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			}
 		}
 
+		const publishDiagnostic = yield* WriterDiagnostics
+		const observeMaintenance = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
+			Effect.suspend(() => {
+				const startedAt = Date.now()
+				publishDiagnostic({ _tag: "maintenance", value: { operation, startedAt, durationMs: null, outcome: "running" } })
+				return effect.pipe(Effect.onExit((exit) => Effect.sync(() => publishDiagnostic({
+					_tag: "maintenance", value: { operation, startedAt, durationMs: Date.now() - startedAt, outcome: exit._tag === "Success" ? "completed" : "failed" },
+				}))))
+			})
+
 		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
 			yield* Effect.sync(() => {
 				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
@@ -1079,7 +1090,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		if (opts.runRetention) {
 			// Cleanup runs on the telemetry worker, never the HTTP event loop.
 			yield* Effect.forkScoped(Effect.repeat(
-				Effect.andThen(reconcileTraceSummaries, cleanupExpired()).pipe(Effect.catchCause((cause) => Effect.logWarning(`motel: maintenance pass failed: ${Cause.pretty(cause)}`))),
+				observeMaintenance("retention", Effect.andThen(reconcileTraceSummaries, cleanupExpired())).pipe(Effect.catchCause((cause) => Effect.logWarning(`motel: maintenance pass failed: ${Cause.pretty(cause)}`))),
 				Schedule.spaced(`${config.otel.retentionIntervalSeconds} seconds`),
 			))
 
@@ -1089,7 +1100,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			// burst of inserts grows the freelist again. Decoupling lets us
 			// catch up adaptively (see VACUUM_PAGES_BUSY/PANIC) without
 			// changing the cost of the heavier delete sweep.
-			yield* Effect.forkScoped(Effect.repeat(reclaimSpace(), Schedule.spaced("10 seconds")))
+			yield* Effect.forkScoped(Effect.repeat(observeMaintenance("reclaim", reclaimSpace()), Schedule.spaced("10 seconds")))
 
 			// Periodically refresh query planner stats. `PRAGMA optimize` is a
 			// no-op when nothing has changed, so this is essentially free on idle
@@ -1099,7 +1110,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			const refreshPlannerStats = Effect.sync(() => {
 				try { db.exec(`PRAGMA optimize;`) } catch { /* ignore */ }
 			})
-			yield* Effect.forkScoped(Effect.repeat(refreshPlannerStats, Schedule.spaced("15 minutes")))
+			yield* Effect.forkScoped(Effect.repeat(observeMaintenance("planner", refreshPlannerStats), Schedule.spaced("15 minutes")))
 		}
 
 		// Incrementally rebuild historical AI attributes in bounded batches.

@@ -27,12 +27,12 @@ export class IngestError extends Schema.TaggedError<IngestError>()("IngestError"
 
 export const IngestRpcs = RpcGroup.make(
 	Rpc.make("ingestTraces", {
-		payload: { payload: Schema.Unknown },
+		payload: { payload: Schema.Unknown, bytes: Schema.optionalKey(Schema.Number) },
 		success: Schema.Struct({ insertedSpans: Schema.Number }),
 		error: IngestError,
 	}),
 	Rpc.make("ingestLogs", {
-		payload: { payload: Schema.Unknown },
+		payload: { payload: Schema.Unknown, bytes: Schema.optionalKey(Schema.Number) },
 		success: Schema.Struct({ insertedLogs: Schema.Number }),
 		error: IngestError,
 	}),

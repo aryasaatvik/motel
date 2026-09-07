@@ -1,7 +1,8 @@
 import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
+import { IngestReadiness } from "./ingestReadiness.ts"
 import { isAlive, isManagedDaemonProcess, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, processIdentity, removeRegistryEntry, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
@@ -58,6 +59,7 @@ type DaemonConfig = {
 }
 
 export type DaemonStatus = {
+	readonly readiness?: IngestReadiness
 	readonly running: boolean
 	readonly managed: boolean
 	readonly service: string | null
@@ -321,8 +323,18 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 		}
 
 		const mismatch = describeManagedMismatch(health)
+		let readiness: IngestReadiness | undefined
+		if (mismatch === null) {
+			try {
+				const response = await fetch(`${config.baseUrl}/api/readiness`, { signal: AbortSignal.timeout(timeoutMs) })
+				if (response.status === 200 || response.status === 503) {
+					readiness = Schema.decodeUnknownSync(IngestReadiness)(await response.json())
+				}
+			} catch { /* Older daemons can still answer the identity handshake. */ }
+		}
 		const managed = mismatch === null && registry?.pid === health.pid && registry.instanceId === health.instanceId && isManagedDaemonProcess(registry)
 		return {
+			readiness,
 			running: mismatch === null,
 			managed,
 			service: health.service,

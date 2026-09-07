@@ -135,3 +135,22 @@ telemetry. Correlated logs may include secrets, tokens, or PII if your
 app logs them; AI call traces may include full prompt content and
 response text. Treat the local SQLite store as sensitive development
 data when pointing motel at real workloads.
+
+### Ingestion readiness
+
+`GET /api/health` reports process identity and liveness. `GET /api/readiness` reports cached
+writer diagnostics without querying SQLite or joining the ingestion queue. It returns HTTP
+200 for `ready`, and 503 for `starting`, `overloaded`, or `failed`. `motel status` includes this
+snapshot when the daemon supports it; older servers remain compatible.
+
+`overloaded` means an awaiting request is at least five seconds old or at least 64 requests
+are outstanding. This is a pressure signal, not an instruction to restart a shared daemon.
+Idle time does not imply failure. `failed` records worker exit/error and requires operator
+inspection. Outstanding counts/bytes describe awaiting callers, not durable queued data;
+client cancellation cannot undo a SQLite commit. Empty probes do not advance `lastCommitAt`.
+Maintenance reports its latest operation, duration, and outcome without telemetry payloads.
+
+Run `bun scripts/bench-shared-daemon.ts` for an isolated reduced-cap mixed workload, or add
+`--1gib` for the representative capacity profile. Both create and remove their own database,
+include a held reader, and report request latency percentiles, failures, and database/WAL size.
+They never benchmark the shared machine-global database.
