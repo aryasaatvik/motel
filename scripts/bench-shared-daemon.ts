@@ -17,6 +17,17 @@ process.env.MOTEL_OTEL_RETENTION_LOG_BATCH = "250"
 const manager = createDaemonManager({ runtimeDir: root, databasePath, port })
 const base = `http://127.0.0.1:${port}`
 const samples: Record<string, number[]> = {}
+const maintenance = new Map<number, unknown>()
+let observing = true
+const observe = async () => {
+	while (observing) {
+		try {
+			const value = await (await fetch(`${base}/api/readiness`, { signal: AbortSignal.timeout(1000) })).json() as { maintenance?: { startedAt: number; durationMs: number | null } }
+			if (value.maintenance) maintenance.set(value.maintenance.startedAt, value.maintenance)
+		} catch {}
+		await new Promise((resolve) => setTimeout(resolve, 100))
+	}
+}
 let failures = 0
 let records = 0
 const request = async (name: string, path: string, body?: unknown) => {
@@ -46,6 +57,7 @@ const traces = (run: number) => ({ resourceSpans: [{ resource: { attributes: att
 const bytes = (file: string) => { try { return statSync(file).size } catch { return 0 } }
 try {
 	await Effect.runPromise(manager.ensure)
+	void observe()
 	// Seed beyond the configured live-page target while retention is active.
 	const rounds = representative ? 1400 : 30
 	for (let round = 0; round < rounds; round++) {
@@ -86,8 +98,9 @@ try {
 		const quantile = (q: number) => Math.round(values[Math.min(values.length - 1, Math.floor(values.length * q))]! * 100) / 100
 		return [name, { count: values.length, p50: quantile(.5), p95: quantile(.95), p99: quantile(.99), max: quantile(1) }]
 	}))
-	console.log(JSON.stringify({ profile: representative ? "1gib" : "reduced", capMb, failures, before, after: { database: bytes(databasePath), wal: bytes(`${databasePath}-wal`), pages, free }, milliseconds: summary }, null, 2))
+	console.log(JSON.stringify({ profile: representative ? "1gib" : "reduced", capMb, failures, maintenance: [...maintenance.values()], before, after: { database: bytes(databasePath), wal: bytes(`${databasePath}-wal`), pages, free }, milliseconds: summary }, null, 2))
 } finally {
+	observing = false
 	await Effect.runPromise(manager.stop)
 	rmSync(root, { recursive: true, force: true })
 }
