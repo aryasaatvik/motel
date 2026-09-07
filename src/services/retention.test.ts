@@ -7,7 +7,7 @@ import { checkpointPassive, installRetentionSchema, mergeFts, repairSearchRows, 
 
 const schema = (db: Database) => {
 	db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 15000;
-		CREATE TABLE spans(trace_id TEXT, span_id TEXT, PRIMARY KEY(trace_id, span_id));
+		CREATE TABLE spans(trace_id TEXT, span_id TEXT, start_time_ms INTEGER DEFAULT 1, end_time_ms INTEGER DEFAULT 2, PRIMARY KEY(trace_id, span_id));
 		CREATE TABLE span_attributes(trace_id TEXT, span_id TEXT, key TEXT, value TEXT);
 		CREATE INDEX attrs_trace ON span_attributes(trace_id);
 		CREATE TABLE trace_summaries(trace_id TEXT PRIMARY KEY, started_at_ms INTEGER, ended_at_ms INTEGER, active_span_count INTEGER);
@@ -33,10 +33,10 @@ test("huge traces disappear atomically, drain by rows, survive reopen, and prese
 		db.exec("INSERT INTO trace_summaries VALUES ('large', 1, 2, 0), ('active', 1, 0, 1), ('boundary', 1, 100, 0)")
 		db.transaction(() => {
 			for (let index = 0; index < 200; index++) {
-				db.query("INSERT INTO spans VALUES ('large', ?)").run(String(index))
+				db.query("INSERT INTO spans(trace_id, span_id) VALUES ('large', ?)").run(String(index))
 				for (let attr = 0; attr < 4; attr++) db.query("INSERT INTO span_attributes VALUES ('large', ?, ?, 'value')").run(String(index), String(attr))
 			}
-			db.exec("INSERT INTO spans VALUES ('active','a'), ('boundary','b'); INSERT INTO logs VALUES (1, 'large', 1000, 'INFO'); INSERT INTO log_attributes VALUES (1,'key','value')")
+			db.exec("INSERT INTO spans(trace_id, span_id) VALUES ('active','a'), ('boundary','b'); INSERT INTO logs VALUES (1, 'large', 1000, 'INFO'); INSERT INTO log_attributes VALUES (1,'key','value')")
 		})()
 		const result = retainBatch(db, options)
 		expect(result.rows).toBeLessThanOrEqual(options.rows)
@@ -64,7 +64,7 @@ test("failed cleanup rolls back its visibility marker and rows", () => {
 	const db = new Database(":memory:")
 	try {
 		schema(db)
-		db.exec(`INSERT INTO trace_summaries VALUES ('trace',1,2,0); INSERT INTO spans VALUES ('trace','span');
+		db.exec(`INSERT INTO trace_summaries VALUES ('trace',1,2,0); INSERT INTO spans(trace_id, span_id) VALUES ('trace','span');
 			INSERT INTO span_attributes VALUES ('trace','span','key','value');
 			CREATE TRIGGER fail_delete BEFORE DELETE ON span_attributes BEGIN SELECT RAISE(ABORT, 'injected failure'); END;`)
 		expect(() => retainBatch(db, options)).toThrow("injected failure")
@@ -88,7 +88,7 @@ test("PASSIVE reports an incomplete checkpoint without waiting for a held reader
 		reader = new Database(path, { readonly: true })
 		reader.exec("BEGIN")
 		reader.query("SELECT * FROM spans").all()
-		writer.exec("INSERT INTO spans VALUES ('trace','span')")
+		writer.exec("INSERT INTO spans(trace_id, span_id) VALUES ('trace','span')")
 		const start = performance.now()
 		const result = checkpointPassive(writer)
 		expect(performance.now() - start).toBeLessThan(500)
@@ -131,6 +131,9 @@ test("legacy orphan repair advances a bounded cursor and maps live FTS rowids", 
 		expect(count(db, "log_attributes")).toBe(20)
 		expect(count(db, "log_body_fts")).toBe(20)
 		expect(count(db, "log_search_rows")).toBe(20)
+		const before = db.query("SELECT total_changes() AS n").get() as { n: number }
+		for (let pass = 0; pass < 5; pass++) repairSearchRows(db, 5)
+		expect(db.query("SELECT total_changes() AS n").get()).toEqual(before)
 		const expired = retainBatch(db, { ...options, cutoff: 2000, logs: 1, rows: 100 })
 		expect(expired.markedLogs).toBe(1)
 		expect(count(db, "logs")).toBe(19)
@@ -146,4 +149,22 @@ test("retention selectors use ordered partial indexes", () => {
 		expect(plan.some(({ detail }) => detail.includes("idx_retention_ended"))).toBe(true)
 		expect(plan.some(({ detail }) => detail.includes("TEMP B-TREE"))).toBe(false)
 	} finally { db.close() }
+})
+
+
+test("stale upgraded summaries cannot evict active spans under age or size retention", () => {
+	for (const maxBytes of [Number.MAX_SAFE_INTEGER, 0]) {
+		const db = new Database(":memory:")
+		try {
+			schema(db)
+			db.exec("INSERT INTO trace_summaries VALUES ('stale', 1, 2, 0)")
+			db.exec("INSERT INTO spans(trace_id,span_id,start_time_ms,end_time_ms) VALUES ('stale','running',1,0)")
+			retainBatch(db, { ...options, maxBytes })
+			expect(count(db, "retained_spans")).toBe(1)
+			expect(count(db, "retention_traces")).toBe(0)
+			db.exec("UPDATE spans SET end_time_ms = 2")
+			retainBatch(db, { ...options, maxBytes })
+			expect(count(db, "retained_spans")).toBe(0)
+		} finally { db.close() }
+	}
 })

@@ -3,6 +3,7 @@ import type { Database } from "bun:sqlite"
 /** Additive schema: unfinished eviction is hidden from every public query. */
 export const installRetentionSchema = (db: Database) => {
 	db.exec(`
+		CREATE INDEX IF NOT EXISTS idx_retention_active_spans ON spans(trace_id) WHERE end_time_ms <= 0 OR end_time_ms < start_time_ms;
 		CREATE INDEX IF NOT EXISTS idx_retention_ended ON trace_summaries(ended_at_ms, trace_id) WHERE active_span_count = 0 AND ended_at_ms > 0;
 		CREATE INDEX IF NOT EXISTS idx_retention_started ON trace_summaries(started_at_ms, trace_id) WHERE active_span_count = 0;
 		CREATE INDEX IF NOT EXISTS idx_logs_severity_nocase_cursor ON logs(severity_text COLLATE NOCASE, timestamp_ms DESC, id DESC);
@@ -54,15 +55,19 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 	const oversized = (pageCount - free) * pageSize > options.maxBytes
 	const pending = (db.query("SELECT count(*) AS n FROM retention_traces").get() as { n: number }).n
 	const slots = Math.max(0, options.traces - pending)
+	// Upgrade-era summaries may undercount active spans. The partial index verifies
+	// actual span state before either age- or size-based eviction can select a trace.
 	if (slots > 0) {
 		db.query(`INSERT OR IGNORE INTO retention_traces SELECT trace_id FROM trace_summaries
 			WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ?
 			AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = trace_summaries.trace_id)
+			AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = trace_summaries.trace_id AND (s.end_time_ms <= 0 OR s.end_time_ms < s.start_time_ms))
 			ORDER BY ended_at_ms, trace_id LIMIT ?`).run(options.cutoff, slots)
 		if (oversized) {
 			const remaining = Math.max(0, options.traces - (db.query("SELECT count(*) AS n FROM retention_traces").get() as { n: number }).n)
 			db.query(`INSERT OR IGNORE INTO retention_traces SELECT trace_id FROM trace_summaries
 				WHERE active_span_count = 0 AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = trace_summaries.trace_id)
+				AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = trace_summaries.trace_id AND (s.end_time_ms <= 0 OR s.end_time_ms < s.start_time_ms))
 				ORDER BY started_at_ms, trace_id LIMIT ?`).run(remaining)
 		}
 	}
@@ -126,12 +131,14 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 	return { pending: oversized || traceIds.length > 0 || logIds.length > 0, rows: options.rows - remaining, markedTraces: traceIds.length, markedLogs: logIds.length }
 })()
 
-/** Bounded keyset repair of legacy orphan rows and legacy FTS reverse mappings. */
+/** One-time bounded legacy repair. Current ingestion and deletion maintain mappings atomically. */
 export const repairSearchRows = (db: Database, limit: number) => db.transaction(() => {
 	for (const table of ["log_attributes", "log_body_fts", "span_operation_fts"] as const) {
 		if (!db.query("SELECT 1 FROM sqlite_master WHERE name = ?").get(table)) continue
 		const key = `retention_repair_${table}`
-		const cursor = Number((db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(key) as { value: string } | null)?.value ?? 0)
+		const marker = (db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(key) as { value: string } | null)?.value
+		if (marker === "complete") continue
+		const cursor = Number(marker ?? 0)
 		const columns = table === "span_operation_fts" ? "trace_id, span_id" : "log_id"
 		const rows = db.query(`SELECT rowid AS repair_id, ${columns} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT ?`).all(cursor, limit) as { repair_id: number; log_id?: number | string; trace_id?: string; span_id?: string }[]
 		for (const row of rows) {
@@ -147,6 +154,6 @@ export const repairSearchRows = (db: Database, limit: number) => db.transaction(
 				db.query("INSERT OR REPLACE INTO log_search_rows VALUES (?, ?)").run(row.repair_id, Number(row.log_id))
 			}
 		}
-		db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, String(rows.length < limit ? 0 : rows.at(-1)!.repair_id))
+		db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, rows.length < limit ? "complete" : String(rows.at(-1)!.repair_id))
 	}
 })()
