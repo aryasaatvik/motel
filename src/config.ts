@@ -39,6 +39,8 @@ export const config = {
 		traceLookbackMinutes: parsePositiveInt(process.env.MOTEL_OTEL_TRACE_LOOKBACK_MINUTES, 1440),
 		traceFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_TRACE_LIMIT, 100),
 		logFetchLimit: parsePositiveInt(process.env.MOTEL_OTEL_LOG_LIMIT, 80),
+		queryCapacity: Math.min(parsePositiveInt(process.env.MOTEL_OTEL_QUERY_CAPACITY, 8), 64),
+		queryDeadlineMs: Math.min(parsePositiveInt(process.env.MOTEL_OTEL_QUERY_DEADLINE_MS, 5_000), 30_000),
 		retentionHours: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_HOURS, 168),
 		maxDbSizeMb: parsePositiveInt(process.env.MOTEL_OTEL_MAX_DB_SIZE_MB, 1024),
 		retentionTraceBatch: parsePositiveInt(process.env.MOTEL_OTEL_RETENTION_TRACE_BATCH, 100),

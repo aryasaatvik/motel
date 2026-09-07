@@ -9,6 +9,11 @@ import {
 import { IngestReadiness } from "./ingestReadiness.js"
 
 const ErrorResponse = Schema.Struct({ error: Schema.String })
+const QueryFailures = [
+	Schema.Struct({ error: Schema.String, code: Schema.Literals(["QUERY_OVERLOADED", "QUERY_UNAVAILABLE"]) }).pipe(HttpApiSchema.status(503)),
+	Schema.Struct({ error: Schema.String, code: Schema.Literal("QUERY_DEADLINE") }).pipe(HttpApiSchema.status(504)),
+] as const
+
 const Meta = Schema.Struct({
 	limit: Schema.Number,
 	lookback: Schema.String,
@@ -99,7 +104,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 					.annotate(OpenApi.Summary, "Ingest OTLP logs")
 					.annotate(OpenApi.Description, "Accepts OTLP HTTP log export requests and stores them in the local SQLite telemetry store."),
 
-				HttpApiEndpoint.get("services", "/api/services", { success: ServiceList })
+				HttpApiEndpoint.get("services", "/api/services", { success: ServiceList, error: QueryFailures })
 					.annotate(OpenApi.Summary, "List active services")
 					.annotate(OpenApi.Description, "Returns service names that have emitted spans or logs within the default lookback window. Use this to discover what services are reporting, then query their traces or logs."),
 
@@ -111,6 +116,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: TraceSummaryList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "List recent traces")
 					.annotate(OpenApi.Description, "Returns compact trace summaries ordered by start time descending. Use /api/traces/{traceId} for the full span tree. Supports cursor pagination and applies default/max limit and lookback bounds."),
@@ -135,6 +141,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: TraceSummaryList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Search traces with filters")
 					.annotate(OpenApi.Description, "Search compact trace summaries with filters. Use /api/traces/{traceId} for full details. Supports cursor pagination, attr.<key> filters in the query string, and aiText for full-text search across LLM prompt/response content."),
@@ -151,7 +158,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: StatList,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Aggregate trace statistics")
 					.annotate(OpenApi.Description, "Returns grouped trace aggregates such as count, average duration, p95 duration, or error rate. Supports the same core filters as trace search plus groupBy dimensions like service, operation, status, and attr.<key>."),
@@ -161,7 +168,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						traceId: Schema.String.pipe(Schema.annotateKey({ description: "Full 32-character hex trace ID" })),
 					},
 					success: TraceResponse,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Get a single trace")
 					.annotate(OpenApi.Description, "Returns the full trace with all spans ordered by parent-child hierarchy. Returns 404 if the trace ID is not found or has expired."),
@@ -171,7 +178,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						traceId: Schema.String.pipe(Schema.annotateKey({ description: "Full 32-character hex trace ID" })),
 					},
 					success: HtmlText,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Render a browser trace page")
 					.annotate(OpenApi.Description, "Renders a simple HTML waterfall/log view for one trace, suitable for opening from the TUI or browser."),
@@ -186,6 +193,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: LogList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Get logs for a trace")
 					.annotate(OpenApi.Description, "Returns log records correlated with the given trace, across all spans. Ordered by timestamp descending. Supports cursor pagination and bounded lookback/limit defaults."),
@@ -195,6 +203,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						traceId: Schema.String.pipe(Schema.annotateKey({ description: "Full 32-character hex trace ID" })),
 					},
 					success: SpanList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "List spans for a trace")
 					.annotate(OpenApi.Description, "Returns the flat list of spans for one trace, preserving trace context on each row. Useful for span-level filtering and sorting without traversing the full tree shape."),
@@ -204,7 +213,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						spanId: Schema.String.pipe(Schema.annotateKey({ description: "Full 16-character hex span ID" })),
 					},
 					success: SpanResponse,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Get a single span")
 					.annotate(OpenApi.Description, "Returns a span by its ID, including the parent trace ID and root operation name for context. Returns 404 if the span is not found."),
@@ -219,6 +228,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: LogList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Get logs for a span")
 					.annotate(OpenApi.Description, "Returns log records correlated with the given span. Ordered by timestamp descending. Supports cursor pagination and bounded lookback/limit defaults."),
@@ -236,6 +246,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: PaginatedSpanList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Search spans directly")
 					.annotate(OpenApi.Description, "Search spans directly instead of root traces. Supports service, traceId, operation, parentOperation, status, lookback, limit, attr.<key>=<value> (exact match), and attrContains.<key>=<substring> (case-insensitive substring search inside attribute values) in the query string."),
@@ -260,6 +271,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: LogList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Search logs")
 					.annotate(OpenApi.Description, "Search log records by service, severity, trace/span correlation, or body text (case-insensitive). Supports attr.<key>=<value> (exact match) and attrContains.<key>=<substring> (case-insensitive substring) in the query string. Cursor pagination and bounded lookback/limit defaults. Ordered by timestamp descending."),
@@ -278,6 +290,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						cursor: CursorParam,
 					},
 					success: LogList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Alias for log search")
 					.annotate(OpenApi.Description, "Same behavior as GET /api/logs. Exists as an explicit search endpoint for agents and scripts that distinguish list vs search routes."),
@@ -294,7 +307,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: StatList,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Aggregate log statistics")
 					.annotate(OpenApi.Description, "Returns grouped log counts by fields like severity, service, scope, or attr.<key>. Useful for quickly understanding log distribution before drilling into raw entries."),
@@ -329,7 +342,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: FacetList,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Get facet value counts")
 					.annotate(OpenApi.Description, "Returns distinct values and their counts for a given field, useful for discovering what data exists before querying. Examples: ?type=logs&field=severity returns log level distribution; ?type=traces&field=attribute_keys&service=opencode lists top span attribute keys; ?type=traces&field=attribute_values&key=ai.model.id lists values seen for that key."),
@@ -351,6 +364,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: AiCallList,
+					error: QueryFailures,
 				})
 					.annotate(OpenApi.Summary, "Search AI calls")
 					.annotate(OpenApi.Description, "Search AI SDK calls (streamText, generateText, etc.) with normalized fields. Returns compact summaries with previews — use /api/ai/calls/{spanId} for full prompt/response payloads. Supports filtering by service, session, model, provider, function, operation, status, duration, and free-text search across prompt/response content."),
@@ -360,7 +374,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						spanId: Schema.String.pipe(Schema.annotateKey({ description: "The span ID of the AI call" })),
 					},
 					success: AiCallDetailResponse,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Get AI call detail")
 					.annotate(OpenApi.Description, "Returns the full detail of a single AI call including complete prompt messages, response text, tool calls with args, token usage, timing, provider metadata, and correlated logs."),
@@ -386,7 +400,7 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 						limit: LimitParam,
 					},
 					success: StatList,
-					error: ErrorResponse,
+					error: [ErrorResponse, ...QueryFailures],
 				})
 					.annotate(OpenApi.Summary, "Aggregate AI call statistics")
 					.annotate(OpenApi.Description, "Returns grouped statistics for AI calls. Supports grouping by provider, model, functionId, sessionId, or status with aggregations: count, avg_duration, p95_duration, total_input_tokens, total_output_tokens."),

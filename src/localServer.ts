@@ -12,6 +12,7 @@ import { AI_LIST, LOG_LIST, LOG_STATS, SPAN_LIST, TRACE_LIST, TRACE_STATS, listM
 import { MOTEL_SERVICE_ID, MOTEL_VERSION, processIdentity, removeRegistryEntry, writeRegistryEntry } from "./registry.js"
 import { AsyncIngest, AsyncIngestLive } from "./services/AsyncIngest.js"
 import { TelemetryStoreReadonly } from "./services/TelemetryStore.js"
+import { QueryOverloaded, QueryDeadlineExceeded, QueryUnavailable } from "./services/queryRpc.js"
 import { TelemetryQueryLive } from "./services/TelemetryQuery.js"
 import type { LogItem, TraceItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
@@ -48,14 +49,21 @@ const withRead = <A>(f: (store: TelemetryStoreReadonly["Service"]) => Effect.Eff
 // Response-building helpers are generic in R so a handler can depend
 // on AsyncIngest (worker-RPC path) or TelemetryStoreReadonly (query
 // path) without forcing every handler onto the same service surface.
+const queryErrorResponse = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	if (error instanceof QueryOverloaded) return jsonResponse({ error: message, code: "QUERY_OVERLOADED" }, 503)
+	if (error instanceof QueryDeadlineExceeded) return jsonResponse({ error: message, code: "QUERY_DEADLINE" }, 504)
+	if (error instanceof QueryUnavailable) return jsonResponse({ error: message, code: "QUERY_UNAVAILABLE" }, 503)
+	return jsonResponse({ error: message }, 500)
+}
 const respondJson = <A, R>(effect: Effect.Effect<A, unknown, R>) =>
 	Effect.match(effect, {
-		onFailure: (error) => jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 500),
+		onFailure: queryErrorResponse,
 		onSuccess: (value) => jsonResponse(value),
 	})
 const respondRaw = <R>(effect: Effect.Effect<ReturnType<typeof jsonResponse>, unknown, R>) =>
 	Effect.match(effect, {
-		onFailure: (error) => jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 500),
+		onFailure: queryErrorResponse,
 		onSuccess: (value) => value,
 	})
 
@@ -559,13 +567,14 @@ export const ServerLive = HttpRouter.serve(
 	// to the spans table as noise.
 	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/api/health", "/api/readiness", "/v1/traces", "/v1/logs"])),
 	// The telemetry worker owns ingest, migrations, and bounded maintenance.
-	// The HTTP thread only opens an existing database read-only (or bootstraps
-	// a brand-new empty one), keeping health independent of writer work.
+	// Readonly subprocesses keep native SQLite calls off the HTTP event loop and
+	// can be terminated on deadline without retiring the ingestion worker.
 	Layer.provideMerge(AsyncIngestLive),
 	Layer.provideMerge(TelemetryQueryLive),
 	Layer.provideMerge(BunHttpServer.layer({
 		port: config.otel.port,
 		hostname: config.otel.host,
+		idleTimeout: Math.ceil(config.otel.queryDeadlineMs / 1000) + 5,
 		reusePort: true,
 		routes: {
 			"/api/health": () => Response.json(healthPayload()),

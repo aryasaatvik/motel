@@ -146,7 +146,6 @@ export const useTraceScreenData = () => {
 	}, [parsedFilter.aiText])
 
 	const selectedTraceRef = useRef<string | null>(null)
-	const cacheEpochRef = useRef(0)
 	const traceDetailCacheRef = useRef(new Map<string, { data: TraceItem | null; fetchedAt: Date }>())
 	const traceLogCacheRef = useRef(new Map<string, { data: readonly LogItem[]; fetchedAt: Date }>())
 	const serviceLogCacheRef = useRef(new Map<string, { data: readonly LogItem[]; fetchedAt: Date }>())
@@ -164,12 +163,9 @@ export const useTraceScreenData = () => {
 	}, [autoRefresh, setRefreshNonce])
 
 	useEffect(() => {
-		cacheEpochRef.current += 1
 		traceDetailCacheRef.current.clear()
 		traceLogCacheRef.current.clear()
 		serviceLogCacheRef.current.clear()
-		traceDetailInflightRef.current.clear()
-		traceLogInflightRef.current.clear()
 		invalidateAiCallDetailCache()
 	}, [refreshNonce])
 
@@ -181,13 +177,15 @@ export const useTraceScreenData = () => {
 	// actually opens the picker.
 	useEffect(() => {
 		if (!selectedTraceService) return
-		void ensureTraceAttributeKeys(selectedTraceService)
-			.then((entry) => Promise.allSettled(
-				entry.data
-					.slice(0, 6)
-					.map((row) => ensureTraceAttributeValues(selectedTraceService, row.value)),
-			))
-			.catch(() => {})
+		let cancelled = false
+		void (async () => {
+			const entry = await ensureTraceAttributeKeys(selectedTraceService)
+			for (const row of entry.data.slice(0, 2)) {
+				if (cancelled) return
+				await ensureTraceAttributeValues(selectedTraceService, row.value)
+			}
+		})().catch(() => {})
+		return () => { cancelled = true }
 	}, [selectedTraceService])
 
 	useEffect(() => {
@@ -278,10 +276,8 @@ export const useTraceScreenData = () => {
 			return existing
 		}
 
-		const epoch = cacheEpochRef.current
 		const request = loadTraceDetail(traceId)
 			.then((trace) => {
-				if (cacheEpochRef.current !== epoch) return { error: null }
 				const fetchedAt = new Date()
 				traceDetailCacheRef.current.set(traceId, { data: trace, fetchedAt })
 				if (hydrateSelection && selectedTraceRef.current === traceId) {
@@ -291,7 +287,7 @@ export const useTraceScreenData = () => {
 			})
 			.catch((error) => {
 				const message = error instanceof Error ? error.message : String(error)
-				if (cacheEpochRef.current === epoch && hydrateSelection && selectedTraceRef.current === traceId) {
+				if (hydrateSelection && selectedTraceRef.current === traceId) {
 					setTraceDetailState({ status: "error", traceId, data: null, error: message, fetchedAt: null })
 				}
 				return { error: message }
@@ -331,10 +327,8 @@ export const useTraceScreenData = () => {
 			return existing
 		}
 
-		const epoch = cacheEpochRef.current
 		const request = loadTraceLogs(traceId)
 			.then((logs) => {
-				if (cacheEpochRef.current !== epoch) return { error: null }
 				const fetchedAt = new Date()
 				traceLogCacheRef.current.set(traceId, { data: logs, fetchedAt })
 				if (hydrateSelection && selectedTraceRef.current === traceId) {
@@ -344,7 +338,7 @@ export const useTraceScreenData = () => {
 			})
 			.catch((error) => {
 				const message = error instanceof Error ? error.message : String(error)
-				if (cacheEpochRef.current === epoch && hydrateSelection && selectedTraceRef.current === traceId) {
+				if (hydrateSelection && selectedTraceRef.current === traceId) {
 					setLogState({ status: "error", traceId, data: [], error: message, fetchedAt: null })
 				}
 				return { error: message }

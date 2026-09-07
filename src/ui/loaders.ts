@@ -4,11 +4,22 @@ import { queryRuntime } from "../runtime.ts"
 import { TelemetryStoreReadonly } from "../services/TelemetryStore.ts"
 import { makeCachedLoader } from "./cachedLoader.ts"
 
+// Refreshes join matching in-flight work; settled results are not retained here.
+const pendingLoads = new Map<string, Promise<unknown>>()
+const query = <A>(key: readonly unknown[], effect: Effect.Effect<A, Error, TelemetryStoreReadonly>): Promise<A> => {
+	const hash = JSON.stringify(key)
+	const existing = pendingLoads.get(hash)
+	if (existing) return existing as Promise<A>
+	const request = queryRuntime.runPromise(effect).finally(() => pendingLoads.delete(hash))
+	pendingLoads.set(hash, request)
+	return request
+}
+
 export const loadTraceServices = () =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listServices))
+	query(["services"], Effect.flatMap(TelemetryStoreReadonly, (service) => service.listServices))
 
 export const loadRecentTraceSummaries = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceSummaries(serviceName)))
+	query(["summaries", serviceName], Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceSummaries(serviceName)))
 
 /**
  * Server-side trace summary search. Accepts any combination of:
@@ -29,7 +40,7 @@ export const loadFilteredTraceSummaries = (
 		readonly aiText?: string | null
 	},
 ) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.searchTraceSummaries({
+	query(["summaries", serviceName, options], Effect.flatMap(TelemetryStoreReadonly, (service) => service.searchTraceSummaries({
 		serviceName,
 		attributeFilters: options.attributeFilters,
 		aiText: options.aiText ?? null,
@@ -92,10 +103,10 @@ export const invalidateFacetCaches = () => {
 }
 
 export const loadTraceDetail = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.getTrace(traceId)))
+	query(["trace", traceId], Effect.flatMap(TelemetryStoreReadonly, (service) => service.getTrace(traceId)))
 
 export const loadTraceLogs = (traceId: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceLogs(traceId)))
+	query(["trace-logs", traceId], Effect.flatMap(TelemetryStoreReadonly, (service) => service.listTraceLogs(traceId)))
 
 export const loadServiceLogs = (serviceName: string) =>
-	queryRuntime.runPromise(Effect.flatMap(TelemetryStoreReadonly, (service) => service.listRecentLogs(serviceName)))
+	query(["service-logs", serviceName], Effect.flatMap(TelemetryStoreReadonly, (service) => service.listRecentLogs(serviceName)))

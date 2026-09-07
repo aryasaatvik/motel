@@ -144,6 +144,7 @@ const runOne = async (loaded: LoadedRuntime): Promise<Sample> => {
 		).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
 	)
 
+	if (result.length !== Math.min(traces, 100)) throw new Error(`Expected ${Math.min(traces, 100)} benchmark results, received ${result.length}`)
 	return {
 		elapsedMs: performance.now() - startedAt,
 		resultCount: result.length,

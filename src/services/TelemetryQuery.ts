@@ -1,39 +1,26 @@
-import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Effect, Layer, Scope } from "effect"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type { WorkerError } from "effect/unstable/workers/WorkerError"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
+import { Effect, Layer } from "effect"
+import { config } from "../config.js"
 import { TelemetryStoreReadonly, type TelemetryStoreReader } from "./TelemetryStore.js"
-import { QueryRpcs } from "./queryRpc.js"
-
-type QueryMethod = keyof TelemetryStoreReader
-type QueryClient = RpcClient.FromGroup<typeof QueryRpcs, RpcClientError | WorkerError>
-
-const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
-	Layer.provide(RpcSerialization.layerMsgPack),
-	Layer.provide(BunWorker.layer(() => new Worker(new URL("./telemetryQueryWorker.ts", import.meta.url)))),
-)
-
-const query = <A>(getClient: Effect.Effect<QueryClient, unknown>, method: QueryMethod, args: readonly unknown[] = []) =>
-	Effect.flatMap(getClient, (client) => client.query({ method, args })).pipe(
-		Effect.map((result) => result as A),
-		Effect.mapError((error) => error instanceof Error ? error : new Error(String(error))),
-	)
+import { QueryScheduler } from "./queryScheduler.js"
+import { QueryError, QueryOverloaded, QueryDeadlineExceeded, QueryUnavailable } from "./queryRpc.js"
 
 export const TelemetryQueryLive = Layer.effect(
 	TelemetryStoreReadonly,
 	Effect.gen(function*() {
-		const scope = yield* Scope.Scope
-		const getClient = yield* Effect.cached(Effect.gen(function*() {
-			const clientScope = yield* Scope.fork(scope, "sequential")
-			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
-			return yield* RpcClient.make(QueryRpcs).pipe(
-				Effect.provide(protocolContext),
-				Effect.provideService(Scope.Scope, clientScope),
-			)
-		}))
-		const run = <A>(method: QueryMethod, args: readonly unknown[] = []) => query<A>(getClient, method, args)
+		const scheduler = yield* Effect.acquireRelease(
+			Effect.sync(() => new QueryScheduler({
+				workerUrl: new URL("./telemetryQueryProcess.ts", import.meta.url),
+				capacity: config.otel.queryCapacity,
+			environment: { ...process.env, MOTEL_OTEL_DB_PATH: config.otel.databasePath },
+				deadlineMs: config.otel.queryDeadlineMs,
+			})),
+			(scheduler) => Effect.promise(() => scheduler.close()),
+		)
+		const run = <A>(method: keyof TelemetryStoreReader, args: readonly unknown[] = []) => Effect.tryPromise({
+			try: (signal) => scheduler.query(method, args, signal) as Promise<A>,
+			catch: (error) => error instanceof QueryError || error instanceof QueryOverloaded || error instanceof QueryDeadlineExceeded || error instanceof QueryUnavailable
+				? error : new QueryUnavailable({ message: String(error) }),
+		})
 		return TelemetryStoreReadonly.of({
 			listServices: run("listServices"),
 			listRecentTraces: (serviceName, options) => run("listRecentTraces", [serviceName, options]),

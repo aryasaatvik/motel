@@ -21,3 +21,23 @@ describe("makeCachedLoader", () => {
 		expect(loader.get("key")).toBe(2)
 	})
 })
+
+it("refresh and invalidation coalesce an in-flight request without stale cleanup deleting its successor", async () => {
+	let resolve: (value: number) => void = () => {}
+	let loads = 0
+	const loader = makeCachedLoader<string, number>({ load: () => { loads++; return new Promise((done) => { resolve = done }) } })
+	const first = loader.ensure("key")
+	loader.invalidate()
+	expect(loader.refresh("key")).toBe(first)
+	expect(loader.ensure("key")).toBe(first)
+	expect(loads).toBe(1)
+	resolve(1)
+	expect(await first).toBe(1)
+	expect(loader.get("key")).toBe(1)
+	const second = loader.refresh("key")
+	expect(loads).toBe(2)
+	expect(loader.refresh("key")).toBe(second)
+	resolve(2)
+	await second
+	expect(loader.get("key")).toBe(2)
+})

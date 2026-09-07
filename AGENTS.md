@@ -97,7 +97,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `src/server.ts` runs the local server without the TUI.
 - `src/instructions.ts` contains the copied setup instructions for other Effect apps.
 - `src/services/TelemetryStore.ts` persists traces and logs in SQLite and exposes indexed queries through writer and read-only service identifiers.
-- `src/services/TelemetryQuery.ts` proxies read-only store calls to `src/services/telemetryQueryWorker.ts`, keeping synchronous Bun SQLite queries off the HTTP event loop.
+- `src/services/TelemetryQuery.ts` schedules read-only store calls through a bounded queue and a disposable subprocess containing `src/services/telemetryQueryWorker.ts`. Deadlines and cancellation terminate that process to release synchronous SQLite readers; the HTTP server and TUI share this architecture.
 - `src/config.ts` is the source of truth for ports and env-driven OTEL settings.
 - `web/` is a Vite + React SPA for the browser-based UI (Tailwind CSS, `@effect/atom-react`, `AtomHttpApi`).
 - `web/src/api.ts` creates the typed `AtomHttpApi.Service` client from `src/httpApi.ts`.
@@ -147,6 +147,9 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `MOTEL_OTEL_MAX_DB_SIZE_MB`: defaults to `1024` (size-based retention cap)
 - `MOTEL_OTEL_RETENTION_TRACE_BATCH`: defaults to `100` completed traces per cleanup pass
 - `MOTEL_OTEL_RETENTION_LOG_BATCH`: defaults to `5000` logs per cleanup pass
+- `MOTEL_OTEL_QUERY_CAPACITY`: defaults to `8` outstanding queries per runtime (maximum `64`)
+- `MOTEL_OTEL_QUERY_DEADLINE_MS`: defaults to `5000` including queue and startup time (maximum `30000`)
+- `MOTEL_OTEL_RETENTION_ROW_BATCH`: defaults to `1000` physical rows per cleanup pass
 - `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`: defaults to `10`
 
 ## TUI Keys

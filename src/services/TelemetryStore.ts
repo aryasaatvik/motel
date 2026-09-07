@@ -784,7 +784,10 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			try { db.exec(`PRAGMA busy_timeout = 15000;`) } catch { /* ignore */ }
 		} // end: if (!opts.readonly) writer init
 
-		if (!opts.readonly) installRetentionSchema(db)
+		if (!opts.readonly) {
+			installRetentionSchema(db)
+			db.exec("CREATE INDEX IF NOT EXISTS idx_spans_roots ON spans(trace_id, start_time_ms) WHERE parent_span_id IS NULL")
+		}
 		const hasRetention = db.query("SELECT 1 FROM sqlite_master WHERE name = 'retained_spans'").get() !== null
 		const spanSource = hasRetention ? "retained_spans" : "spans"
 		const logSource = hasRetention ? "retained_logs" : "logs"
@@ -1462,74 +1465,59 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				}
 
 				const candidateRows = db.query(`
-					SELECT s.trace_id, s.span_id, s.parent_span_id, s.operation_name, s.start_time_ms
+					SELECT s.trace_id, s.span_id, s.parent_span_id, s.operation_name, s.start_time_ms,
+						(SELECT p.operation_name FROM ${spanSource} p WHERE p.trace_id = s.trace_id AND p.span_id = s.parent_span_id) AS parent_operation_name
 					${fromSql}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY s.start_time_ms DESC
 					LIMIT ?
-				`).all(...joinParams, ...params, candidateLimit) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number }>
+				`).all(...joinParams, ...params, candidateLimit) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number; parent_operation_name: string | null }>
 
-				const traceIds = [...new Set(candidateRows.map((row) => row.trace_id))]
-				if (traceIds.length === 0) return [] as readonly SpanItem[]
-
-				const keyOf = (traceId: string, spanId: string) => `${traceId}:${spanId}`
-				const spanContextById = new Map<string, { readonly parentSpanId: string | null; readonly operationName: string }>()
-
-				// Bulk-prefetch parent metadata for every span in every trace
-				// touched by the candidate set. One indexed scan per trace_id
-				// is much cheaper than a per-span lookup loop while computing
-				// depth, and we get the trace-root lookup in the same pass.
-				const placeholders = traceIds.map(() => "?").join(", ")
-				const allSpanRows = db.query(`
-					SELECT trace_id, span_id, parent_span_id, operation_name, start_time_ms
-					FROM ${spanSource}
-					WHERE trace_id IN (${placeholders})
-				`).all(...traceIds) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string; start_time_ms: number }>
-
-				const rootOperationByTraceId = new Map<string, { operationName: string; startTimeMs: number }>()
-				for (const row of allSpanRows) {
-					spanContextById.set(keyOf(row.trace_id, row.span_id), {
-						parentSpanId: row.parent_span_id,
-						operationName: row.operation_name,
-					})
-					if (row.parent_span_id === null) {
-						const existing = rootOperationByTraceId.get(row.trace_id)
-						if (!existing || row.start_time_ms < existing.startTimeMs) {
-							rootOperationByTraceId.set(row.trace_id, { operationName: row.operation_name, startTimeMs: row.start_time_ms })
-						}
-					}
-				}
-
-				const getSpanContext = (traceId: string, spanId: string) => spanContextById.get(keyOf(traceId, spanId)) ?? null
-
-				const depthById = new Map<string, number>()
-				const getDepth = (traceId: string, spanId: string, visiting = new Set<string>()): number => {
-					const key = keyOf(traceId, spanId)
-					const cached = depthById.get(key)
-					if (cached !== undefined) return cached
-					if (visiting.has(key)) return 0
-					visiting.add(key)
-					const context = getSpanContext(traceId, spanId)
-					const depth = context?.parentSpanId ? getDepth(traceId, context.parentSpanId, visiting) + 1 : 0
-					depthById.set(key, depth)
-					return depth
-				}
-
-				// Apply parentOperation post-filter on the lite candidate set
-				// (cheap — string compare against cached parent op) and then
-				// slice down to the final result size before parsing any JSON.
+				// Keep the public Unicode substring matching and candidate-window semantics.
+				// Parent metadata is an indexed point lookup, not whole-trace hydration.
 				const parentOperationNeedle = input.parentOperation?.toLowerCase() ?? null
-				const filteredLite: typeof candidateRows = []
-				for (const row of candidateRows) {
-					if (parentOperationNeedle) {
-						const parent = row.parent_span_id ? getSpanContext(row.trace_id, row.parent_span_id) : null
-						if (!parent?.operationName.toLowerCase().includes(parentOperationNeedle)) continue
-					}
-					filteredLite.push(row)
-					if (filteredLite.length >= limit) break
-				}
-
+				const filteredLite = candidateRows.filter((row) => !parentOperationNeedle || row.parent_operation_name?.toLowerCase().includes(parentOperationNeedle)).slice(0, limit)
 				if (filteredLite.length === 0) return [] as readonly SpanItem[]
+				const keyOf = (traceId: string, spanId: string) => `${traceId}:${spanId}`
+				const anchorValues = filteredLite.map(() => "(?, ?)").join(", ")
+				// UNION deduplicates cycles. Only ancestors of returned spans are loaded;
+				// unrelated siblings and their large metadata never enter this traversal.
+				const ancestors = db.query(`
+					WITH RECURSIVE ancestors(trace_id, span_id, parent_span_id, operation_name) AS (
+						SELECT trace_id, span_id, parent_span_id, operation_name FROM ${spanSource}
+						WHERE (trace_id, span_id) IN (VALUES ${anchorValues})
+						UNION
+						SELECT s.trace_id, s.span_id, s.parent_span_id, s.operation_name
+						FROM ${spanSource} s JOIN ancestors a ON s.trace_id = a.trace_id AND s.span_id = a.parent_span_id
+					) SELECT * FROM ancestors
+				`).all(...filteredLite.flatMap((row) => [row.trace_id, row.span_id])) as Array<{ trace_id: string; span_id: string; parent_span_id: string | null; operation_name: string }>
+				const spanContextById = new Map(ancestors.map((row) => [keyOf(row.trace_id, row.span_id), { parentSpanId: row.parent_span_id, operationName: row.operation_name }]))
+				const getSpanContext = (traceId: string, spanId: string) => spanContextById.get(keyOf(traceId, spanId)) ?? null
+				const rootOperationByTraceId = new Map<string, { operationName: string }>()
+				for (const traceId of new Set(filteredLite.map((row) => row.trace_id))) {
+					const root = db.query(`SELECT operation_name FROM ${spanSource} WHERE trace_id = ? AND parent_span_id IS NULL ORDER BY start_time_ms LIMIT 1`).get(traceId) as { operation_name: string } | null
+					if (root) rootOperationByTraceId.set(traceId, { operationName: root.operation_name })
+				}
+				const depthById = new Map<string, number>()
+				const getDepth = (traceId: string, spanId: string): number => {
+					const path: string[] = []
+					const visiting = new Set<string>()
+					let current: string | null = spanId
+					let depth = 0
+					while (current) {
+						const key = keyOf(traceId, current)
+						const cached = depthById.get(key)
+						if (cached !== undefined) { depth = cached; break }
+						if (visiting.has(key)) break
+						const context = getSpanContext(traceId, current)
+						if (!context?.parentSpanId) { depthById.set(key, 0); break }
+						visiting.add(key)
+						path.push(key)
+						current = context.parentSpanId
+					}
+					for (const key of path.reverse()) depthById.set(key, ++depth)
+					return depthById.get(keyOf(traceId, spanId)) ?? 0
+				}
 
 				// Hydrate only the kept rows: one batched fetch of the full
 				// SpanRow (with resource_json / attributes_json / events_json)

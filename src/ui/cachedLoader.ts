@@ -12,7 +12,7 @@ export interface CachedLoader<K, V> {
 	readonly ensure: (key: K) => Promise<V>
 	/** Loads the latest value while deduplicating any load already running for this key. */
 	readonly refresh: (key: K) => Promise<V>
-	/** Drops every cached value and aborts dedup tracking for in-flight loads. */
+	/** Drops cached values while preserving in-flight deduplication; refresh joins the current load. */
 	readonly invalidate: () => void
 }
 
@@ -53,7 +53,6 @@ export const makeCachedLoader = <K, V>(opts: CachedLoaderOptions<K, V>): CachedL
 
 	const invalidate = () => {
 		cache.clear()
-		inflight.clear()
 	}
 
 	return { get, ensure, refresh, invalidate }
