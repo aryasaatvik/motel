@@ -159,3 +159,18 @@ Concurrent starts publish a complete shared lock atomically. Ensure operations p
 daemon when ingestion is slow; explicit operator recovery remains available through `motel restart`.
 An unreadable lock or interrupted stale-lock recovery fails closed and reports its path for inspection.
 When maintenance operations overlap, readiness shows the oldest active operation before a completed one.
+
+Retention marks completed traces and expired logs before removing dependent rows. Public query
+results hide the whole marked trace, including correlated logs, while bounded cleanup proceeds.
+Markers persist across restarts. Arrivals for a marked trace are discarded as part of its eviction
+and do not count as inserted records; once cleanup finishes, later exports may recreate that trace.
+Active traces are not selected. SQLite tables are internal storage; direct SQL consumers should
+use the `retained_spans`, `retained_logs`, and `retained_trace_summaries` views for this visibility rule.
+
+`MOTEL_OTEL_RETENTION_ROW_BATCH` defaults to 1000 logical rows per cleanup batch, split across
+traces and logs. It bounds row cardinality, not the size of one telemetry field. Cleanup yields
+100 ms between batches while making progress, then returns to the configured idle interval.
+Routine checkpoints use PASSIVE and report busy/frame counts in readiness; physical reclamation
+is deferred for held readers. The configured database target and WAL size limit are not hard caps.
+Existing orphan attributes/FTS entries are repaired with bounded keyset scans; normal ingests
+maintain reverse FTS mappings for indexed cleanup.
