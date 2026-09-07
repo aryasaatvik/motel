@@ -131,13 +131,12 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 	return { pending: oversized || traceIds.length > 0 || logIds.length > 0, rows: options.rows - remaining, markedTraces: traceIds.length, markedLogs: logIds.length }
 })()
 
-/** One-time bounded legacy repair. Current ingestion and deletion maintain mappings atomically. */
+/** Bounded repair scans only rowids beyond its durable high-water mark; idle passes do not write. */
 export const repairSearchRows = (db: Database, limit: number) => db.transaction(() => {
 	for (const table of ["log_attributes", "log_body_fts", "span_operation_fts"] as const) {
 		if (!db.query("SELECT 1 FROM sqlite_master WHERE name = ?").get(table)) continue
 		const key = `retention_repair_${table}`
 		const marker = (db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(key) as { value: string } | null)?.value
-		if (marker === "complete") continue
 		const cursor = Number(marker ?? 0)
 		const columns = table === "span_operation_fts" ? "trace_id, span_id" : "log_id"
 		const rows = db.query(`SELECT rowid AS repair_id, ${columns} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT ?`).all(cursor, limit) as { repair_id: number; log_id?: number | string; trace_id?: string; span_id?: string }[]
@@ -154,6 +153,6 @@ export const repairSearchRows = (db: Database, limit: number) => db.transaction(
 				db.query("INSERT OR REPLACE INTO log_search_rows VALUES (?, ?)").run(row.repair_id, Number(row.log_id))
 			}
 		}
-		db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, rows.length < limit ? "complete" : String(rows.at(-1)!.repair_id))
+		if (rows.length > 0) db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, String(rows.at(-1)!.repair_id))
 	}
 })()
