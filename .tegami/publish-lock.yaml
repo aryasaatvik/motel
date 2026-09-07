@@ -1,10 +1,18 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Honor explicit services and normalize severity queries\n\nThe TUI now honors an explicitly configured service before restoring its remembered\nselection. Log searches match severity names regardless of ASCII casing, and severity\nstatistics and facets group those variants consistently while preserving stored log text.\nA matching index keeps case-insensitive severity searches efficient.\n"
-    filename: 2026-09-07-upstream-maintenance.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: minor\n---\n\n## Inspect ingestion readiness without waiting for SQLite\n\n`GET /api/readiness` and `motel status` expose cached writer startup, backlog, commit progress,\nand maintenance timing. Busy ingestion no longer needs another queued write to explain its\nstate. OTLP responses still acknowledge only committed records.\n\nConcurrent cold starts now publish their shared startup lock atomically. Ensure operations\npreserve an existing live daemon when ingestion is slow or unavailable, and report operator\ndiagnostics instead of restarting another worktree's writer.\n"
+    filename: 2026-09-07-ingest-readiness.md
+    v: 0.0.0
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Bound query backlog and cancel obsolete work\n\nRead-only queries now have bounded FIFO admission and deadlines, with explicit HTTP 503/504\nerrors. Expired executing queries release their SQLite reader before subsequent work runs;\ningestion keeps its own worker. The TUI coalesces refreshes and bounds facet prefetch, and\nspan searches load only the ancestors of returned spans instead of whole traces.\n"
+    filename: 2026-09-07-bounded-queries.md
+    v: 0.0.0
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Keep ingestion progressing during retention\n\nRoutine checkpoints no longer wait for long-running readers, and readiness reports incomplete\ncheckpoint progress. Retention hides completed traces atomically and removes their rows in\nbounded, recoverable batches. Active traces remain protected. FTS merging now runs correctly,\nand indexed deletion plus bounded legacy repair avoids repeated orphan-table scans.\n"
+    filename: 2026-09-07-bounded-maintenance.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - 2026-09-07-upstream-maintenance.md
+      - 2026-09-07-ingest-readiness.md
+      - 2026-09-07-bounded-queries.md
+      - 2026-09-07-bounded-maintenance.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
