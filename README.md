@@ -50,7 +50,7 @@ curl -fsSL https://bun.sh/install | bash
 the keyboard cheat sheet, or `c` to copy paste-ready setup instructions
 for any Effect/OTEL app you want to trace.
 
-Requirements: [Bun](https://bun.sh/) v1.1 or newer.
+Requirements: [Bun](https://bun.sh/) matching `package.json` `engines.bun` (`>=1.3.0`).
 
 ### macOS service from the maintained checkout
 
