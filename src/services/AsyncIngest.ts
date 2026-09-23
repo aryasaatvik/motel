@@ -20,7 +20,7 @@
  */
 
 import * as BunWorker from "@effect/platform-bun/BunWorker"
-import { Context, Effect, Layer, Scope, Schema } from "effect"
+import { Context, Effect, Latch, Layer, Scope, Schema } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
@@ -52,14 +52,23 @@ export const AsyncIngestLive = Layer.effect(
 			const event = Schema.decodeUnknownSync(WriterEvent)(data)
 			progress.receive(event)
 		}
+		// Opens once the current worker has answered the platform handshake (or
+		// died). Effect's worker close message is only received after that
+		// handshake; one posted earlier is dropped and the platform finalizer
+		// then waits five seconds before terminating the worker.
+		let handshake = Latch.makeUnsafe(true)
 		const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
 			Layer.provide(RpcSerialization.layerMsgPack),
 			Layer.provide(BunWorker.layer(() => {
 				const worker = new Worker(new URL("./telemetryWorker.ts", import.meta.url), {
 					env: { ...process.env, MOTEL_INGEST_DIAGNOSTICS_CHANNEL: channelName },
 				})
-				worker.addEventListener("error", () => progress.fail())
-				worker.addEventListener("close", () => progress.fail())
+				const spawned = Latch.makeUnsafe(false)
+				handshake = spawned
+				const settle = () => spawned.openUnsafe()
+				worker.addEventListener("message", settle, { once: true })
+				worker.addEventListener("error", () => { settle(); progress.fail() })
+				worker.addEventListener("close", () => { settle(); progress.fail() })
 				return worker
 			})),
 		)
@@ -76,6 +85,10 @@ export const AsyncIngestLive = Layer.effect(
 		const getClient = yield* Effect.cached(Effect.gen(function*() {
 			const clientScope = yield* Scope.fork(scope, "sequential")
 			const protocolContext = yield* Layer.buildWithScope(WorkerProtocol, clientScope)
+			// Added after the protocol's finalizers, so it runs before them: a
+			// shutdown during worker startup waits for the handshake and then
+			// closes the writer gracefully instead of timing out and terminating it.
+			yield* Scope.addFinalizer(clientScope, Effect.suspend(() => handshake.await).pipe(Effect.timeoutOption("5 seconds")))
 			return yield* RpcClient.make(IngestRpcs).pipe(
 				Effect.provide(protocolContext),
 				Effect.provideService(Scope.Scope, clientScope),
