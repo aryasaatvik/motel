@@ -16,7 +16,7 @@ const query = <A>(effect: Effect.Effect<A, unknown, TelemetryStoreReadonly>) =>
 
 const optional = (value: Option.Option<string>, fallback?: string) => Option.getOrElse(value, () => fallback)
 
-const searchOperand = Argument.string("service-or-filter").pipe(
+const searchOperand = Argument.String("service-or-filter").pipe(
 	Argument.mapTryCatch(
 		(value) => {
 			if (value.startsWith("attr.") && !isAttributeFilterToken(value)) {
@@ -34,8 +34,8 @@ const services = Command.make("services", {}, () =>
 ).pipe(Command.withDescription("List observed telemetry services"))
 
 const traces = Command.make("traces", {
-	service: Argument.string("service").pipe(Argument.optional),
-	limit: Argument.integer("limit").pipe(Argument.optional),
+	service: Argument.String("service").pipe(Argument.optional),
+	limit: Argument.Int("limit").pipe(Argument.optional),
 }, ({ service, limit }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) =>
 		store.listRecentTraces(optional(service, config.otel.serviceName)!, {
@@ -45,13 +45,13 @@ const traces = Command.make("traces", {
 ).pipe(Command.withDescription("List recent traces"))
 
 const trace = Command.make("trace", {
-	traceId: Argument.string("trace-id"),
+	traceId: Argument.String("trace-id"),
 }, ({ traceId }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.getTrace(traceId))),
 ).pipe(Command.withDescription("Get one trace"))
 
 const span = Command.make("span", {
-	spanId: Argument.string("span-id"),
+	spanId: Argument.String("span-id"),
 }, ({ spanId }) =>
 	Effect.promise(() => fetch(`${config.otel.queryUrl}/api/spans/${encodeURIComponent(spanId)}`).then((response) => response.json())).pipe(
 		Effect.andThen(json),
@@ -59,7 +59,7 @@ const span = Command.make("span", {
 ).pipe(Command.withDescription("Get one span"))
 
 const traceSpans = Command.make("trace-spans", {
-	traceId: Argument.string("trace-id"),
+	traceId: Argument.String("trace-id"),
 }, ({ traceId }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listTraceSpans(traceId))),
 ).pipe(Command.withDescription("List spans in one trace"))
@@ -102,8 +102,8 @@ const searchTraces = Command.make("search-traces", {
 }).pipe(Command.withDescription("Search trace summaries by service, operation, and attributes"))
 
 const traceStats = Command.make("trace-stats", {
-	groupBy: Argument.string("groupBy"),
-	agg: Argument.choice("aggregation", ["count", "avg_duration", "p95_duration", "error_rate"]),
+	groupBy: Argument.String("groupBy"),
+	agg: Argument.Literals("aggregation", ["count", "avg_duration", "p95_duration", "error_rate"]),
 	args: searchOperand,
 }, ({ groupBy, agg, args }) => {
 	const values = args as ReadonlyArray<string>
@@ -121,7 +121,7 @@ const instructions = Command.make("instructions", {}, () => Console.log(otelServ
 	.pipe(Command.withDescription("Print Effect telemetry setup instructions"))
 
 const logs = Command.make("logs", {
-	service: Argument.string("service").pipe(Argument.optional),
+	service: Argument.String("service").pipe(Argument.optional),
 }, ({ service }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listRecentLogs(optional(service, config.otel.serviceName)!))),
 ).pipe(Command.withDescription("List recent logs"))
@@ -141,7 +141,7 @@ const searchLogs = Command.make("search-logs", {
 }).pipe(Command.withDescription("Search logs by service, body, and attributes"))
 
 const logStats = Command.make("log-stats", {
-	groupBy: Argument.string("groupBy"),
+	groupBy: Argument.String("groupBy"),
 	args: searchOperand,
 }, ({ groupBy, args }) => {
 	const values = args as ReadonlyArray<string>
@@ -156,13 +156,13 @@ const logStats = Command.make("log-stats", {
 }).pipe(Command.withDescription("Aggregate log metrics"))
 
 const traceLogs = Command.make("trace-logs", {
-	traceId: Argument.string("trace-id"),
+	traceId: Argument.String("trace-id"),
 }, ({ traceId }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listTraceLogs(traceId))),
 ).pipe(Command.withDescription("List logs for one trace"))
 
 const spanLogs = Command.make("span-logs", {
-	spanId: Argument.string("span-id"),
+	spanId: Argument.String("span-id"),
 }, ({ spanId }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchLogs({
 		spanId,
@@ -171,8 +171,8 @@ const spanLogs = Command.make("span-logs", {
 ).pipe(Command.withDescription("List logs for one span"))
 
 const facets = Command.make("facets", {
-	type: Argument.choice("type", ["traces", "logs"]),
-	field: Argument.string("field"),
+	type: Argument.Literals("type", ["traces", "logs"]),
+	field: Argument.String("field"),
 }, ({ type, field }) =>
 	query(Effect.flatMap(TelemetryStoreReadonly, (store) => store.listFacets({ type, field, limit: 20 }))),
 ).pipe(Command.withDescription("List facet values"))

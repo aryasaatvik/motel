@@ -40,7 +40,7 @@ const restart = Command.make("restart", {}, () =>
 
 const serviceManager = createLaunchAgentManager()
 const serviceInstall = Command.make("install", {
-	replace: Flag.boolean("replace").pipe(Flag.withDefault(false)),
+	replace: Flag.Boolean("replace").pipe(Flag.withDefault(false)),
 }, ({ replace }) =>
 	serviceManager.install(replace).pipe(Effect.andThen(json)),
 ).pipe(Command.withDescription("Install the per-user Motel LaunchAgent"))

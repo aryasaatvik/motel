@@ -17,7 +17,6 @@
 import { BunRuntime } from "@effect/platform-bun"
 import * as BunWorkerRunner from "@effect/platform-bun/BunWorkerRunner"
 import { Effect, Layer } from "effect"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import type { OtlpLogExportRequest, OtlpTraceExportRequest } from "../otlp.ts"
 import { WriterDiagnostics, type WriterEvent } from "../ingestReadiness.ts"
@@ -57,7 +56,6 @@ const WorkerLive = RpcServer.layer(IngestRpcs).pipe(
 	Layer.provide(IngestHandlers),
 	Layer.provide(TelemetryStoreWorkerLive),
 	Layer.provide(RpcServer.layerProtocolWorkerRunner),
-	Layer.provide(RpcSerialization.layerMsgPack),
 	Layer.provide(BunWorkerRunner.layer),
 )
 
