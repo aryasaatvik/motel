@@ -1,3 +1,11 @@
+## @aryasaatvik/motel@0.5.0
+
+### Run on Effect 4.0.0-rc.117
+
+Motel now depends on Effect 4.0.0-rc.117. Hosts that override `effect` to rc.113 or later
+crashed at startup with `Argument.string is not a function`, because Effect renamed its CLI
+constructors. MCP server logs now go to stderr, keeping stdout for the protocol.
+
 ## @aryasaatvik/motel@0.4.0
 
 ### Inspect ingestion readiness without waiting for SQLite
