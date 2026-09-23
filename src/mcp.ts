@@ -433,7 +433,8 @@ const ServerLayer = McpServer.toolkit(MotelToolkit).pipe(
 		}),
 	),
 	Layer.provide(BunStdio.layer),
-	Layer.provide(Logger.layer([Logger.consolePretty({ stderr: true })])),
+	// stdout carries the MCP stdio protocol, so logs must go to stderr.
+	Layer.provide(Layer.merge(Logger.layer([Logger.consolePretty()]), Layer.succeed(Logger.LogToStderr, true))),
 )
 
 Layer.launch(ServerLayer).pipe(BunRuntime.runMain)

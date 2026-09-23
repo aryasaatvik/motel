@@ -23,7 +23,6 @@ import * as BunWorker from "@effect/platform-bun/BunWorker"
 import { Context, Effect, Latch, Layer, Scope, Schema } from "effect"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import type { WorkerError } from "effect/unstable/workers/WorkerError"
 import { IngestProgress, WriterEvent, type IngestReadiness } from "../ingestReadiness.ts"
 import { IngestRpcs } from "./ingestRpc.ts"
@@ -58,7 +57,6 @@ export const AsyncIngestLive = Layer.effect(
 		// then waits five seconds before terminating the worker.
 		let handshake = Latch.makeUnsafe(true)
 		const WorkerProtocol = RpcClient.layerProtocolWorker({ size: 1 }).pipe(
-			Layer.provide(RpcSerialization.layerMsgPack),
 			Layer.provide(BunWorker.layer(() => {
 				const worker = new Worker(new URL("./telemetryWorker.ts", import.meta.url), {
 					env: { ...process.env, MOTEL_INGEST_DIAGNOSTICS_CHANNEL: channelName },
