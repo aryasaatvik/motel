@@ -1,3 +1,9 @@
+## @aryasaatvik/motel@0.5.1
+
+### Use stable Effect v4
+
+Upgrade the daemon, CLI, telemetry ingestion, and browser UI to stable Effect 4.0.0 and its matching integrations.
+
 ## @aryasaatvik/motel@0.5.0
 
 ### Run on Effect 4.0.0-rc.117
