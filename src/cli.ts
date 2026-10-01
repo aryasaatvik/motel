@@ -1,5 +1,5 @@
 import { Console, Effect, Option, References } from "effect"
-import { Argument, Command } from "effect/unstable/cli"
+import { Argument, Command } from "effect/cli"
 import { config } from "./config.js"
 import { otelServerInstructions } from "./instructions.js"
 import { attributeFiltersFromArgs, isAttributeFilterToken } from "./queryFilters.js"

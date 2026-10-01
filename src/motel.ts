@@ -2,7 +2,7 @@
 
 import { BunRuntime, BunServices } from "@effect/platform-bun"
 import { Console, Effect, Layer } from "effect"
-import { CliOutput, Command, Flag } from "effect/unstable/cli"
+import { CliOutput, Command, Flag } from "effect/cli"
 import packageJson from "../package.json" with { type: "json" }
 import { queryCommands } from "./cli.js"
 import { applyManagedDaemonEnv } from "./daemon.js"
