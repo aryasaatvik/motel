@@ -2,7 +2,7 @@
 import { BunRuntime, BunStdio } from "@effect/platform-bun"
 import { Effect, Layer, Logger, Schema } from "effect"
 import { MOTEL_VERSION } from "./registry.js"
-import { McpProtocol, McpServer, Tool, Toolkit } from "effect/unstable/ai"
+import { McpProtocol, McpServer, Tool, Toolkit } from "effect/ai"
 import { TraceSpanStatus } from "./domain.js"
 import { MotelClient, MotelClientLive } from "./motelClient.js"
 import { Locator, LocatorLive } from "./locator.js"

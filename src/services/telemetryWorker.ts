@@ -17,7 +17,7 @@
 import { BunRuntime } from "@effect/platform-bun"
 import * as BunWorkerRunner from "@effect/platform-bun/BunWorkerRunner"
 import { Effect, Layer } from "effect"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
+import * as RpcServer from "effect/rpc/RpcServer"
 import type { OtlpLogExportRequest, OtlpTraceExportRequest } from "../otlp.ts"
 import { WriterDiagnostics, type WriterEvent } from "../ingestReadiness.ts"
 import { IngestError, IngestRpcs } from "./ingestRpc.ts"

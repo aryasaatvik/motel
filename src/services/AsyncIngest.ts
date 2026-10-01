@@ -21,9 +21,9 @@
 
 import * as BunWorker from "@effect/platform-bun/BunWorker"
 import { Context, Effect, Latch, Layer, Scope, Schema } from "effect"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import type { WorkerError } from "effect/unstable/workers/WorkerError"
+import * as RpcClient from "effect/rpc/RpcClient"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
+import type { WorkerError } from "effect/workers/WorkerError"
 import { IngestProgress, WriterEvent, type IngestReadiness } from "../ingestReadiness.ts"
 import { IngestRpcs } from "./ingestRpc.ts"
 

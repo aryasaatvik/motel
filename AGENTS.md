@@ -90,7 +90,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - `src/ui/useKeyboardNav.ts` centralises the keyboard handlers and
   cross-pane navigation state transitions.
 - `src/motel.ts` composes and runs the public Effect command tree; `src/cli.ts` exports typed telemetry query leaves and handlers.
-- `src/runtime.ts` wires the Effect beta runtime and OTEL trace + log exporters.
+- `src/runtime.ts` wires the Effect runtime and OTEL trace + log exporters.
 - `src/localServer.ts` starts the local Bun OTLP/query server.
 - `src/httpApi.ts` defines the typed Effect HttpApi surface and OpenAPI spec for the local server.
 - `src/httpListPolicy.ts` owns pure HTTP list/search parameter decoding, bounds, cursors, and pagination metadata shaping.
@@ -118,7 +118,7 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 ## Effect Observability Guidance
 - Inspect the target repo’s existing Effect runtime and observability wiring before adding anything new.
 - Prefer the repo’s existing Effect-native observability APIs if available.
-- If `effect/unstable/observability` is already the best fit, prefer it over adding `@effect/opentelemetry`.
+- If `effect/observability` is already the best fit, prefer it over adding `@effect/opentelemetry`.
 - Only add new OpenTelemetry SDK packages when the repo already uses them or they are clearly required.
 - Merge telemetry into the main runtime once, not per-feature.
 - Prefer structured log annotations so fields like `sessionID`, `modelID`, `providerID`, and `tool` are queryable.
