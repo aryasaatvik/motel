@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: minor\n---\n\n## Run on Effect 4.0.0-rc.117\n\nMotel now depends on Effect 4.0.0-rc.117. Hosts that override `effect` to rc.113 or later\ncrashed at startup with `Argument.string is not a function`, because Effect renamed its CLI\nconstructors. MCP server logs now go to stderr, keeping stdout for the protocol.\n"
-    filename: 2026-09-24-effect-rc117.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Use stable Effect v4\n\nUpgrade the daemon, CLI, telemetry ingestion, and browser UI to stable Effect 4.0.0 and its matching integrations.\n"
+    filename: effect-v4-stable.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - 2026-09-24-effect-rc117.md
+      - effect-v4-stable.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
