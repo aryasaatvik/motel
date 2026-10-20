@@ -454,7 +454,7 @@ describe("motel telemetry store", () => {
 				installRetentionSchema(db)
 				await ingest([span('normal', 'root', 'legacyupdated')])
 				assert.deepEqual(names('normal'), ['legacyupdated'])
-				assert.equal(ready(), 'repairing')
+				assert.match(ready(), /^repairing:[1-9][0-9]*$/)
 				for (let pass = 0; ready() !== 'complete' && pass < 20; pass++) repairSearchRows(db, 100)
 				assert.equal(ready(), 'complete')
 
@@ -548,16 +548,16 @@ describe("motel telemetry store", () => {
 					yield* Effect.addFinalizer(() => runtime.disposeEffect)
 					yield* Effect.promise(() => runtime.runPromise(Effect.asVoid(TelemetryStore)))
 					yield* Deferred.await(firstPass).pipe(Effect.timeout('5 seconds'))
-					assert.deepEqual(passes, [{ outcome: 'completed', mapped: 100, state: 'repairing' }])
+					assert.deepEqual(passes, [{ outcome: 'completed', mapped: 100, state: 'repairing:250' }])
 					yield* clock.adjust('100 millis')
 					assert.deepEqual(passes, [
-						{ outcome: 'completed', mapped: 100, state: 'repairing' },
-						{ outcome: 'completed', mapped: 200, state: 'repairing' },
+						{ outcome: 'completed', mapped: 100, state: 'repairing:250' },
+						{ outcome: 'completed', mapped: 200, state: 'repairing:250' },
 					])
 					yield* clock.adjust('100 millis')
 					assert.deepEqual(passes, [
-						{ outcome: 'completed', mapped: 100, state: 'repairing' },
-						{ outcome: 'completed', mapped: 200, state: 'repairing' },
+						{ outcome: 'completed', mapped: 100, state: 'repairing:250' },
+						{ outcome: 'completed', mapped: 200, state: 'repairing:250' },
 						{ outcome: 'completed', mapped: 250, state: 'complete' },
 					])
 					yield* clock.adjust('100 millis')

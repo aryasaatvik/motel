@@ -190,17 +190,17 @@ test("operation mapping readiness waits for complete legacy repair and stays idl
 		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toBeNull()
 		expect(repairSearchRows(db, 1)).toBe(true)
 		expect(count(db, "span_search_rows")).toBe(1)
-		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing:3" })
 		db.close()
 		db = new Database(path)
 		installRetentionSchema(db)
 		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "1" })
 		expect(repairSearchRows(db, 1)).toBe(true)
 		expect(count(db, "span_search_rows")).toBe(2)
-		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
-		expect(repairSearchRows(db, 1)).toBe(true)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing:3" })
+		expect(repairSearchRows(db, 1)).toBe(false)
 		expect(count(db, "span_operation_fts")).toBe(2)
-		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
 		expect(repairSearchRows(db, 1)).toBe(false)
 		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
 		db.close()
@@ -239,9 +239,81 @@ test("an unavailable optional span index does not request fast repair retries", 
 	const db = new Database(":memory:")
 	try {
 		schema(db)
-		db.query("UPDATE motel_maintenance SET value = 'repairing' WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		db.query("UPDATE motel_maintenance SET value = 'repairing:3' WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
 		db.exec("DROP TABLE span_operation_fts")
 		expect(repairSearchRows(db, 3)).toBe(false)
-		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing:3" })
 	} finally { db.close() }
+})
+
+
+test("legacy span mapping finishes its fixed range despite mapped arrivals and reopen", () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-mapping-target-"))
+	const path = join(root, "test.sqlite")
+	let db = new Database(path)
+	const state = () => db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)
+	const append = (id: number, mapped: boolean) => {
+		db.query("INSERT INTO spans(trace_id, span_id) VALUES (?, 's')").run(String(id))
+		db.query("INSERT INTO span_operation_fts(rowid, trace_id, span_id, operation_name) VALUES (?, ?, 's', 'operation')").run(id, String(id))
+		if (mapped) db.query("INSERT INTO span_search_rows VALUES (?, ?, 's')").run(id, String(id))
+	}
+	try {
+		schema(db)
+		db.query("DELETE FROM motel_maintenance WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		for (let id = 1; id <= 4; id++) append(id, false)
+		db.exec("INSERT OR REPLACE INTO motel_maintenance VALUES ('retention_repair_span_operation_fts', '999')")
+		installRetentionSchema(db)
+		const captured = state()
+		expect(repairSearchRows(db, 2)).toBe(true)
+		for (let id = 5; id <= 8; id++) append(id, true)
+		db.close()
+		db = new Database(path)
+		installRetentionSchema(db)
+		expect(state()).toEqual(captured)
+		// Complete the exact full-sized final batch without scanning the mapped arrivals.
+		expect(repairSearchRows(db, 2)).toBe(false)
+		expect(state()).toEqual({ value: "complete" })
+		expect(captured).toEqual({ value: "repairing:4" })
+		expect(count(db, "span_search_rows")).toBe(8)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "4" })
+		// Ordinary incremental repair still visits later rows, without requesting fast cadence.
+		expect(repairSearchRows(db, 2)).toBe(false)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "6" })
+		expect(repairSearchRows(db, 2)).toBe(false)
+		const before = db.query("SELECT total_changes() AS n").get()
+		expect(repairSearchRows(db, 2)).toBe(false)
+		expect(db.query("SELECT total_changes() AS n").get()).toEqual(before)
+	} finally { db.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
+test("fixed-range repair rolls back failures and completes after its target row is removed", () => {
+	const db = new Database(":memory:")
+	try {
+		schema(db)
+		db.query("DELETE FROM motel_maintenance WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		db.exec("INSERT INTO spans(trace_id,span_id) VALUES ('a','s'),('b','s'); INSERT INTO span_operation_fts(trace_id,span_id,operation_name) VALUES ('a','s','alpha'),('b','s','beta')")
+		installRetentionSchema(db)
+		expect(repairSearchRows(db, 1)).toBe(true)
+		db.exec("CREATE TRIGGER refuse_repair BEFORE INSERT ON span_search_rows WHEN NEW.trace_id = 'b' BEGIN SELECT RAISE(ABORT, 'repair failure'); END")
+		expect(() => repairSearchRows(db, 1)).toThrow("repair failure")
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing:2" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "1" })
+		db.exec("DROP TRIGGER refuse_repair; DELETE FROM span_operation_fts WHERE rowid = 2")
+		expect(repairSearchRows(db, 1)).toBe(false)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
+	} finally { db.close() }
+})
+
+test("malformed persistent span migration state fails without resetting its cursor", () => {
+	for (const state of ["repairing", "repairing:0", "repairing:1.5", "repairing:9007199254740992", "unknown"]) {
+		const db = new Database(":memory:")
+		try {
+			schema(db)
+			db.query("UPDATE motel_maintenance SET value = ? WHERE key = ?").run(state, SPAN_SEARCH_MAPPING_READY_KEY)
+			db.exec("INSERT OR REPLACE INTO motel_maintenance VALUES ('retention_repair_span_operation_fts', '7')")
+			expect(() => installRetentionSchema(db)).toThrow("Invalid span search mapping migration state")
+			expect(() => repairSearchRows(db, 1)).toThrow("Invalid span search mapping migration state")
+			expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "7" })
+		} finally { db.close() }
+	}
 })
