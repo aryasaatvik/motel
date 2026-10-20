@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { checkpointPassive, installRetentionSchema, mergeFts, repairSearchRows, retainBatch } from "./retention.ts"
+import { checkpointPassive, installRetentionSchema, mergeFts, repairSearchRows, retainBatch, SPAN_SEARCH_MAPPING_READY_KEY } from "./retention.ts"
 
 const schema = (db: Database) => {
 	db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 15000;
@@ -167,4 +167,81 @@ test("stale upgraded summaries cannot evict active spans under age or size reten
 			expect(count(db, "retained_spans")).toBe(0)
 		} finally { db.close() }
 	}
+})
+
+
+test("operation mapping readiness waits for complete legacy repair and stays idle after reopen", () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-mapping-ready-"))
+	const path = join(root, "test.sqlite")
+	let db = new Database(path)
+	try {
+		schema(db)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
+		db.query("DELETE FROM motel_maintenance WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		db.exec("INSERT INTO spans(trace_id,span_id) VALUES ('a','s'), ('b','s'); INSERT INTO span_operation_fts(trace_id,span_id,operation_name) VALUES ('a','s','alpha'), ('b','s','beta'), ('orphan','s','orphan')")
+		// All three unmapped historical rows are below the pre-upgrade durable cursor.
+		db.exec("INSERT OR REPLACE INTO motel_maintenance VALUES ('retention_repair_span_operation_fts', '999')")
+		db.exec("CREATE TRIGGER refuse_mapping_marker BEFORE INSERT ON motel_maintenance WHEN NEW.key = 'span_search_mapping_complete' BEGIN SELECT RAISE(ABORT, 'marker failure'); END")
+		expect(() => installRetentionSchema(db)).toThrow("marker failure")
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "999" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toBeNull()
+		db.exec("DROP TRIGGER refuse_mapping_marker")
+		installRetentionSchema(db)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toBeNull()
+		expect(repairSearchRows(db, 1)).toBe(true)
+		expect(count(db, "span_search_rows")).toBe(1)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		db.close()
+		db = new Database(path)
+		installRetentionSchema(db)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "1" })
+		expect(repairSearchRows(db, 1)).toBe(true)
+		expect(count(db, "span_search_rows")).toBe(2)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		expect(repairSearchRows(db, 1)).toBe(true)
+		expect(count(db, "span_operation_fts")).toBe(2)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+		expect(repairSearchRows(db, 1)).toBe(false)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
+		db.close()
+		db = new Database(path)
+		installRetentionSchema(db)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").get()).toEqual({ value: "3" })
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
+		const before = db.query("SELECT total_changes() AS n").get()
+		expect(repairSearchRows(db, 1)).toBe(false)
+		expect(db.query("SELECT total_changes() AS n").get()).toEqual(before)
+	} finally { db.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
+
+test("a final partial span repair returns idle despite remaining log repair", () => {
+	const db = new Database(":memory:")
+	try {
+		schema(db)
+		db.query("DELETE FROM motel_maintenance WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		db.exec("INSERT INTO spans(trace_id, span_id) VALUES ('a', 's'), ('b', 's'); INSERT INTO span_operation_fts(trace_id, span_id, operation_name) VALUES ('a', 's', 'alpha'), ('b', 's', 'beta')")
+		for (let id = 1; id <= 7; id++) {
+			db.query("INSERT INTO logs VALUES (?, NULL, 1000, 'INFO')").run(id)
+			db.query("INSERT INTO log_attributes VALUES (?, 'key', 'value')").run(id)
+			db.query("INSERT INTO log_body_fts(log_id, body) VALUES (?, 'searchable')").run(String(id))
+		}
+		installRetentionSchema(db)
+		expect(repairSearchRows(db, 3)).toBe(false)
+		expect(count(db, "span_search_rows")).toBe(2)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "complete" })
+		expect(count(db, "log_body_fts")).toBe(7)
+		expect(count(db, "log_search_rows")).toBe(3)
+	} finally { db.close() }
+})
+
+test("an unavailable optional span index does not request fast repair retries", () => {
+	const db = new Database(":memory:")
+	try {
+		schema(db)
+		db.query("UPDATE motel_maintenance SET value = 'repairing' WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+		db.exec("DROP TABLE span_operation_fts")
+		expect(repairSearchRows(db, 3)).toBe(false)
+		expect(db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)).toEqual({ value: "repairing" })
+	} finally { db.close() }
 })

@@ -1,5 +1,7 @@
 import type { Database } from "bun:sqlite"
 
+export const SPAN_SEARCH_MAPPING_READY_KEY = "span_search_mapping_complete"
+
 /** Additive schema: unfinished eviction is hidden from every public query. */
 export const installRetentionSchema = (db: Database) => {
 	db.exec(`
@@ -22,6 +24,15 @@ export const installRetentionSchema = (db: Database) => {
 			WHERE NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = logs.trace_id)
 			AND NOT EXISTS (SELECT 1 FROM retention_logs d WHERE d.id = logs.id);
 	`)
+	if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'span_operation_fts' AND type = 'table'").get()) {
+		db.transaction(() => {
+			if (db.query("SELECT 1 FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY)) return
+			// Earlier optional index failures can strand unmapped rows behind the old cursor.
+			db.query("DELETE FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").run()
+			const state = db.query("SELECT 1 FROM span_operation_fts LIMIT 1").get() ? "repairing" : "complete"
+			db.query("INSERT INTO motel_maintenance(key, value) VALUES (?, ?)").run(SPAN_SEARCH_MAPPING_READY_KEY, state)
+		}).immediate()
+	}
 }
 
 export type Checkpoint = { busy: number; log: number; checkpointed: number; deferred: boolean }
@@ -133,6 +144,7 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 
 /** Bounded repair scans only rowids beyond its durable high-water mark; idle passes do not write. */
 export const repairSearchRows = (db: Database, limit: number) => db.transaction(() => {
+	let spanMappingPending = false
 	for (const table of ["log_attributes", "log_body_fts", "span_operation_fts"] as const) {
 		if (!db.query("SELECT 1 FROM sqlite_master WHERE name = ?").get(table)) continue
 		const key = `retention_repair_${table}`
@@ -154,5 +166,12 @@ export const repairSearchRows = (db: Database, limit: number) => db.transaction(
 			}
 		}
 		if (rows.length > 0) db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, String(rows.at(-1)!.repair_id))
+		if (table === "span_operation_fts") {
+			if (rows.length < limit) {
+				db.query("UPDATE motel_maintenance SET value = 'complete' WHERE key = ? AND value = 'repairing'").run(SPAN_SEARCH_MAPPING_READY_KEY)
+			}
+			spanMappingPending = db.query("SELECT 1 FROM motel_maintenance WHERE key = ? AND value = 'repairing'").get(SPAN_SEARCH_MAPPING_READY_KEY) !== null
+		}
 	}
+	return spanMappingPending
 })()
