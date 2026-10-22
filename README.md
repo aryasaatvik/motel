@@ -42,7 +42,7 @@ npm install -g @aryasaatvik/motel
 Don't have Bun?
 
 ```bash
-curl -fsSL https://bun.sh/install | bash
+curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.4"
 ```
 
 `motel` starts the local OTLP ingest server on
@@ -50,7 +50,7 @@ curl -fsSL https://bun.sh/install | bash
 the keyboard cheat sheet, or `c` to copy paste-ready setup instructions
 for any Effect/OTEL app you want to trace.
 
-Requirements: [Bun](https://bun.sh/) matching `package.json` `engines.bun` (`>=1.3.0`).
+Requirements: [Bun](https://bun.sh/) matching `package.json` `engines.bun` (`>=1.4.4`).
 
 ### macOS service from the maintained checkout
 
