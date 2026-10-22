@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Use stable Effect v4\n\nUpgrade the daemon, CLI, telemetry ingestion, and browser UI to stable Effect 4.0.0 and its matching integrations.\n"
-    filename: effect-v4-stable.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Keep trace ingestion fast as history grows\n\nUse indexed row mappings to replace span operation search entries without scanning retained history. Existing databases repair their mappings before enabling this path, and failed search-index updates roll back atomically.\n"
+    filename: trace-search-ingestion.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - effect-v4-stable.md
+      - trace-search-ingestion.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
