@@ -407,6 +407,194 @@ describe("motel telemetry store", () => {
 		}
 	})
 
+
+	it("keeps operation search and mappings atomic across updates, legacy repair and ingest rollback", async () => {
+		const isolatedPath = join(tempDir, "operation-savepoint.sqlite")
+		const script = `
+			const assert = (await import('node:assert/strict')).default
+			const { Database } = await import('bun:sqlite')
+			const { Effect, ManagedRuntime } = await import('effect')
+			const { TelemetryStore, makeTelemetryStoreLayer } = await import('./src/services/TelemetryStore.ts')
+			const { repairSearchRows, installRetentionSchema, SPAN_SEARCH_MAPPING_READY_KEY } = await import('./src/services/retention.ts')
+			const runtime = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: false, runRetention: false }))
+			let db
+			const now = BigInt(Date.now()) * 1000000n
+			const span = (traceId, spanId, name) => ({ traceId, spanId, name, startTimeUnixNano: String(now), endTimeUnixNano: String(now + 1000000n) })
+			const ingest = (spans) => runtime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.ingestTraces({ resourceSpans: [{ resource: { attributes: [{ key: 'service.name', value: { stringValue: 'fts-regression' } }] }, scopeSpans: [{ spans }] }] })))
+			const names = (traceId) => db.query('SELECT operation_name FROM span_operation_fts WHERE trace_id = ? ORDER BY operation_name').all(traceId).map((row) => row.operation_name)
+			const ready = () => db.query('SELECT value FROM motel_maintenance WHERE key = ?').get(SPAN_SEARCH_MAPPING_READY_KEY)?.value
+			const mappingCounts = () => db.query('SELECT (SELECT count(*) FROM span_operation_fts) AS fts, (SELECT count(*) FROM span_search_rows) AS mapping, (SELECT count(*) FROM span_operation_fts f LEFT JOIN span_search_rows m ON m.id = f.rowid WHERE m.id IS NULL) AS unmapped').get()
+			try {
+				await ingest([span('normal', 'root', 'oldoperation')])
+				db = new Database(process.env.MOTEL_OTEL_DB_PATH)
+				assert.equal(ready(), 'complete')
+				await ingest([span('normal', 'root', 'newoperation')])
+				assert.deepEqual(names('normal'), ['newoperation'])
+				assert.equal((await runtime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.searchSpans({ operation: 'oldoperation' })))).length, 0)
+				assert.equal((await runtime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.searchSpans({ operation: 'newoperation' })))).length, 1)
+
+				await ingest(Array.from({ length: 32 }, (_, i) => span('mixed-' + i, 'root', 'mixedold')))
+				await ingest(Array.from({ length: 64 }, (_, i) => span('mixed-' + i, 'root', 'mixednew')))
+				assert.equal(db.query("SELECT count(*) AS n FROM span_operation_fts WHERE operation_name = 'mixedold'").get().n, 0)
+				assert.equal(db.query("SELECT count(*) AS n FROM span_operation_fts WHERE operation_name = 'mixednew'").get().n, 64)
+
+				await ingest([span('duplicate', 'root', 'first'), span('duplicate', 'root', 'second')])
+				assert.deepEqual(names('duplicate'), ['first', 'second'])
+				const acrossBoundary = [span('duplicate', 'root', 'early')]
+				for (let i = 1; i < 499; i++) acrossBoundary.push(span('filler-' + i, 'root', 'filler'))
+				acrossBoundary.push(span('duplicate', 'root', 'middle'), span('duplicate', 'root', 'lateone'), span('duplicate', 'root', 'latetwo'))
+				await ingest(acrossBoundary)
+				assert.deepEqual(names('duplicate'), ['lateone', 'latetwo'])
+				assert.equal(db.query("SELECT operation_name FROM spans WHERE trace_id = 'duplicate' AND span_id = 'root'").get().operation_name, 'latetwo')
+
+				// Simulate an upgraded database with unmapped historical FTS rows.
+				db.query("DELETE FROM motel_maintenance WHERE key IN (?, 'retention_repair_span_operation_fts')").run(SPAN_SEARCH_MAPPING_READY_KEY)
+				db.exec("DELETE FROM span_search_rows WHERE trace_id = 'normal'")
+				db.query("INSERT OR REPLACE INTO motel_maintenance VALUES ('retention_repair_span_operation_fts', '999999')").run()
+				installRetentionSchema(db)
+				await ingest([span('normal', 'root', 'legacyupdated')])
+				assert.deepEqual(names('normal'), ['legacyupdated'])
+				assert.match(ready(), /^repairing:[1-9][0-9]*$/)
+				for (let pass = 0; ready() !== 'complete' && pass < 20; pass++) repairSearchRows(db, 100)
+				assert.equal(ready(), 'complete')
+
+				// Fail mapping after FTS insertion; every chunk of the optional unit must roll back.
+				const before = names('normal')
+				const beforeCounts = mappingCounts()
+				db.exec("CREATE TRIGGER reject_mapping BEFORE INSERT ON span_search_rows WHEN NEW.trace_id = 'normal' BEGIN SELECT RAISE(ABORT, 'mapping failure'); END")
+				const failedChunks = Array.from({ length: 500 }, (_, i) => span('failed-chunk-' + i, 'root', 'mustrollback'))
+				failedChunks.push(span('normal', 'root', 'committedspan'))
+				await ingest(failedChunks)
+				assert.deepEqual(names('normal'), before)
+				assert.deepEqual(mappingCounts(), beforeCounts)
+				assert.equal(db.query("SELECT count(*) AS n FROM span_operation_fts WHERE operation_name = 'mustrollback'").get().n, 0)
+				assert.equal(db.query("SELECT operation_name FROM spans WHERE trace_id = 'normal' AND span_id = 'root'").get().operation_name, 'committedspan')
+				assert.equal(ready(), 'complete')
+				db.exec('DROP TRIGGER reject_mapping')
+				await ingest([span('normal', 'root', 'recovered')])
+				assert.deepEqual(names('normal'), ['recovered'])
+
+				const stableNames = names('normal')
+				const stableCounts = mappingCounts()
+				db.exec("CREATE TRIGGER reject_summary BEFORE INSERT ON trace_summaries WHEN NEW.trace_id = 'normal' BEGIN SELECT RAISE(ABORT, 'summary failure'); END")
+				await assert.rejects(ingest([span('normal', 'root', 'outerrollback')]))
+				assert.deepEqual(names('normal'), stableNames)
+				assert.deepEqual(mappingCounts(), stableCounts)
+				assert.equal(db.query("SELECT operation_name FROM spans WHERE trace_id = 'normal' AND span_id = 'root'").get().operation_name, 'recovered')
+				assert.equal(ready(), 'complete')
+				db.exec('DROP TRIGGER reject_summary')
+			} finally {
+				db?.close()
+				await runtime.dispose()
+			}
+		`
+		const child = Bun.spawn({
+			cmd: [process.execPath, "--no-env-file", "-e", script], cwd: process.cwd(),
+			env: { ...process.env, MOTEL_OTEL_DB_PATH: isolatedPath, MOTEL_OTEL_ENABLED: "false" },
+			stdout: "ignore", stderr: "pipe",
+		})
+		const stderr = await new Response(child.stderr).text()
+		expect(await child.exited, stderr).toBe(0)
+	})
+
+
+	it("repairs legacy span mappings at the pending cadence and idles after completion", async () => {
+		const isolatedPath = join(tempDir, "mapping-repair-pacing.sqlite")
+		const script = `
+			const assert = (await import('node:assert/strict')).default
+			const { Database } = await import('bun:sqlite')
+			const { Clock, Deferred, Effect, Layer, ManagedRuntime } = await import('effect')
+			const { TestClock } = await import('effect/testing')
+			const { TelemetryStore, makeTelemetryStoreLayer } = await import('./src/services/TelemetryStore.ts')
+			const { WriterDiagnostics } = await import('./src/ingestReadiness.ts')
+			const { SPAN_SEARCH_MAPPING_READY_KEY } = await import('./src/services/retention.ts')
+			const now = Date.now()
+			const nanos = BigInt(now) * 1000000n
+			const seed = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: false, runRetention: false }))
+			try {
+				await seed.runPromise(Effect.flatMap(TelemetryStore, (store) => store.ingestTraces({
+					resourceSpans: [{
+						resource: { attributes: [{ key: 'service.name', value: { stringValue: 'mapping-pacing' } }] },
+						scopeSpans: [{ spans: Array.from({ length: 250 }, (_, id) => ({
+							traceId: 'pacing-' + id, spanId: 'root', name: 'legacyoperation',
+							startTimeUnixNano: String(nanos), endTimeUnixNano: String(nanos + 1000000n),
+						})) }],
+					}],
+				})))
+			} finally { await seed.dispose() }
+			const db = new Database(process.env.MOTEL_OTEL_DB_PATH)
+			try {
+				db.exec('DELETE FROM span_search_rows')
+				db.query('DELETE FROM motel_maintenance WHERE key = ?').run(SPAN_SEARCH_MAPPING_READY_KEY)
+				db.exec("INSERT OR REPLACE INTO motel_maintenance VALUES ('retention_repair_span_operation_fts', '999999')")
+				await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+					const clock = yield* TestClock.make()
+					yield* clock.setTime(now + 2)
+					const firstPass = Deferred.makeUnsafe()
+					const passes = []
+					const publish = (event) => {
+						if (event._tag !== 'maintenance' || event.value.operation !== 'retention' || event.value.outcome === 'running') return
+						passes.push({
+							outcome: event.value.outcome,
+							mapped: db.query('SELECT count(*) AS n FROM span_search_rows').get().n,
+							state: db.query('SELECT value FROM motel_maintenance WHERE key = ?').get(SPAN_SEARCH_MAPPING_READY_KEY)?.value,
+						})
+						Deferred.doneUnsafe(firstPass, Effect.void)
+					}
+					const runtime = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: false, runRetention: true }).pipe(
+						Layer.provide(Layer.succeed(Clock.Clock, clock)),
+						Layer.provide(Layer.succeed(WriterDiagnostics, publish)),
+					))
+					yield* Effect.addFinalizer(() => runtime.disposeEffect)
+					yield* Effect.promise(() => runtime.runPromise(Effect.asVoid(TelemetryStore)))
+					yield* Deferred.await(firstPass).pipe(Effect.timeout('5 seconds'))
+					assert.deepEqual(passes, [{ outcome: 'completed', mapped: 100, state: 'repairing:250' }])
+					yield* clock.adjust('100 millis')
+					assert.deepEqual(passes, [
+						{ outcome: 'completed', mapped: 100, state: 'repairing:250' },
+						{ outcome: 'completed', mapped: 200, state: 'repairing:250' },
+					])
+					yield* clock.adjust('100 millis')
+					assert.deepEqual(passes, [
+						{ outcome: 'completed', mapped: 100, state: 'repairing:250' },
+						{ outcome: 'completed', mapped: 200, state: 'repairing:250' },
+						{ outcome: 'completed', mapped: 250, state: 'complete' },
+					])
+					yield* clock.adjust('100 millis')
+					assert.equal(passes.length, 3)
+					yield* clock.adjust('9900 millis')
+					assert.deepEqual(passes.at(-1), { outcome: 'completed', mapped: 250, state: 'complete' })
+					assert.equal(passes.length, 4)
+					yield* runtime.disposeEffect
+					yield* clock.adjust('30 seconds')
+					assert.equal(passes.length, 4)
+				})))
+			} finally { db.close() }
+		`
+		const child = Bun.spawn({
+			cmd: [process.execPath, "--no-env-file", "-e", script], cwd: process.cwd(),
+			env: {
+				...process.env,
+				MOTEL_OTEL_DB_PATH: isolatedPath, MOTEL_OTEL_ENABLED: "false",
+				MOTEL_OTEL_RETENTION_ROW_BATCH: "1000", MOTEL_OTEL_RETENTION_INTERVAL_SECONDS: "10",
+				MOTEL_OTEL_RETENTION_TRACE_BATCH: "100", MOTEL_OTEL_RETENTION_HOURS: "168",
+				MOTEL_OTEL_MAX_DB_SIZE_MB: "1024",
+			},
+			stdout: "ignore", stderr: "pipe",
+		})
+		let timedOut = false
+		const deadline = setTimeout(() => { timedOut = true; child.kill() }, 15_000)
+		try {
+			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+			expect(timedOut, stderr).toBe(false)
+			expect(exitCode, stderr).toBe(0)
+		} finally {
+			clearTimeout(deadline)
+			if (child.exitCode === null) child.kill()
+			await child.exited
+		}
+	}, 20_000)
+
 	it("incrementally backfills historical AI FTS content", async () => {
 		const historicalPath = join(tempDir, "historical-fts.sqlite")
 		const seedScript = `
@@ -466,6 +654,42 @@ describe("motel telemetry store", () => {
 		expect(result?.rootOperationName).toBe("SessionProcessor.stream")
 		expect(result?.span.operationName).toBe("tool.call")
 		expect(result?.span.depth).toBe(1)
+	})
+
+
+	it("opens and searches a read-only pre-retention database without creating mappings", async () => {
+		const legacyPath = join(tempDir, "readonly-pre-retention.sqlite")
+		const script = `
+			const assert = (await import('node:assert/strict')).default
+			const { Database } = await import('bun:sqlite')
+			const { Effect, ManagedRuntime } = await import('effect')
+			const { TelemetryStore, makeTelemetryStoreLayer, TelemetryStoreReadonly, TelemetryStoreReadonlyLive } = await import('./src/services/TelemetryStore.ts')
+			const writer = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: false, runRetention: false }))
+			try {
+				const now = BigInt(Date.now()) * 1000000n
+				await writer.runPromise(Effect.flatMap(TelemetryStore, (store) => store.ingestTraces({ resourceSpans: [{ resource: { attributes: [{ key: 'service.name', value: { stringValue: 'legacy-readonly' } }] }, scopeSpans: [{ spans: [{ traceId: 'legacy-read', spanId: 'root', name: 'legacyoperation', startTimeUnixNano: String(now), endTimeUnixNano: String(now + 1000000n) }] }] }] })))
+			} finally { await writer.dispose() }
+			const legacy = new Database(process.env.MOTEL_OTEL_DB_PATH)
+			legacy.exec('DROP VIEW retained_spans; DROP VIEW retained_logs; DROP VIEW retained_trace_summaries; DROP TABLE span_search_rows; DROP TABLE log_search_rows; DROP TABLE retention_traces; DROP TABLE retention_logs;')
+			const version = legacy.query('PRAGMA schema_version').get().schema_version
+			legacy.close()
+			const reader = ManagedRuntime.make(TelemetryStoreReadonlyLive)
+			try {
+				const trace = await reader.runPromise(Effect.flatMap(TelemetryStoreReadonly, (store) => store.getTrace('legacy-read')))
+				assert.equal(trace?.spans.length, 1)
+				const found = await reader.runPromise(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchSpans({ operation: 'legacyoperation' })))
+				assert.equal(found.length, 1)
+				assert.equal(found[0].traceId, 'legacy-read')
+			} finally { await reader.dispose() }
+			const verify = new Database(process.env.MOTEL_OTEL_DB_PATH, { readonly: true })
+			try {
+				assert.equal(verify.query('PRAGMA schema_version').get().schema_version, version)
+				assert.equal(verify.query("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('span_search_rows', 'log_search_rows', 'retained_spans')").get().n, 0)
+			} finally { verify.close() }
+		`
+		const child = Bun.spawn({ cmd: [process.execPath, "--no-env-file", "-e", script], cwd: process.cwd(), env: { ...process.env, MOTEL_OTEL_DB_PATH: legacyPath }, stdout: "ignore", stderr: "pipe" })
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+		expect(exitCode, stderr).toBe(0)
 	})
 
 	it("returns trace details through the query worker when spans share empty event arrays", async () => {

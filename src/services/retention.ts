@@ -1,5 +1,15 @@
 import type { Database } from "bun:sqlite"
 
+export const SPAN_SEARCH_MAPPING_READY_KEY = "span_search_mapping_complete"
+
+const spanMappingTarget = (state: string): number | null => {
+	if (state === "complete") return null
+	const match = /^repairing:([1-9][0-9]*)$/.exec(state)
+	const target = match === null ? NaN : Number(match[1])
+	if (!Number.isSafeInteger(target)) throw new Error("Invalid span search mapping migration state")
+	return target
+}
+
 /** Additive schema: unfinished eviction is hidden from every public query. */
 export const installRetentionSchema = (db: Database) => {
 	db.exec(`
@@ -22,6 +32,21 @@ export const installRetentionSchema = (db: Database) => {
 			WHERE NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = logs.trace_id)
 			AND NOT EXISTS (SELECT 1 FROM retention_logs d WHERE d.id = logs.id);
 	`)
+	if (db.query("SELECT 1 FROM sqlite_master WHERE name = 'span_operation_fts' AND type = 'table'").get()) {
+		db.transaction(() => {
+			const marker = db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY) as { value: string } | null
+			if (marker !== null) {
+				spanMappingTarget(marker.value)
+				return
+			}
+			// Earlier optional index failures can strand unmapped rows behind the old cursor.
+			db.query("DELETE FROM motel_maintenance WHERE key = 'retention_repair_span_operation_fts'").run()
+			const last = db.query("SELECT rowid AS target FROM span_operation_fts ORDER BY rowid DESC LIMIT 1").get() as { target: number } | null
+			const state = last === null ? "complete" : `repairing:${last.target}`
+			spanMappingTarget(state)
+			db.query("INSERT INTO motel_maintenance(key, value) VALUES (?, ?)").run(SPAN_SEARCH_MAPPING_READY_KEY, state)
+		}).immediate()
+	}
 }
 
 export type Checkpoint = { busy: number; log: number; checkpointed: number; deferred: boolean }
@@ -133,13 +158,23 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 
 /** Bounded repair scans only rowids beyond its durable high-water mark; idle passes do not write. */
 export const repairSearchRows = (db: Database, limit: number) => db.transaction(() => {
+	let spanMappingPending = false
 	for (const table of ["log_attributes", "log_body_fts", "span_operation_fts"] as const) {
 		if (!db.query("SELECT 1 FROM sqlite_master WHERE name = ?").get(table)) continue
 		const key = `retention_repair_${table}`
 		const marker = (db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(key) as { value: string } | null)?.value
 		const cursor = Number(marker ?? 0)
 		const columns = table === "span_operation_fts" ? "trace_id, span_id" : "log_id"
-		const rows = db.query(`SELECT rowid AS repair_id, ${columns} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT ?`).all(cursor, limit) as { repair_id: number; log_id?: number | string; trace_id?: string; span_id?: string }[]
+		let target: number | null = null
+		if (table === "span_operation_fts") {
+			const state = db.query("SELECT value FROM motel_maintenance WHERE key = ?").get(SPAN_SEARCH_MAPPING_READY_KEY) as { value: string } | null
+			if (state === null) throw new Error("Missing span search mapping migration state")
+			target = spanMappingTarget(state.value)
+		}
+		const rows = (target === null
+			? db.query(`SELECT rowid AS repair_id, ${columns} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT ?`).all(cursor, limit)
+			: db.query(`SELECT rowid AS repair_id, ${columns} FROM ${table} WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`).all(cursor, target, limit)
+		) as { repair_id: number; log_id?: number | string; trace_id?: string; span_id?: string }[]
 		for (const row of rows) {
 			const exists = table === "span_operation_fts"
 				? db.query("SELECT 1 FROM spans WHERE trace_id = ? AND span_id = ?").get(row.trace_id!, row.span_id!)
@@ -154,5 +189,13 @@ export const repairSearchRows = (db: Database, limit: number) => db.transaction(
 			}
 		}
 		if (rows.length > 0) db.query("INSERT OR REPLACE INTO motel_maintenance VALUES (?, ?)").run(key, String(rows.at(-1)!.repair_id))
+		if (target !== null) {
+			const nextCursor = rows.at(-1)?.repair_id ?? cursor
+			spanMappingPending = db.query("SELECT 1 FROM span_operation_fts WHERE rowid > ? AND rowid <= ? LIMIT 1").get(nextCursor, target) !== null
+			if (!spanMappingPending) {
+				db.query("UPDATE motel_maintenance SET value = 'complete' WHERE key = ?").run(SPAN_SEARCH_MAPPING_READY_KEY)
+			}
+		}
 	}
+	return spanMappingPending
 })()

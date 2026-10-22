@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite"
 import * as BunFileSystem from "@effect/platform-bun/BunFileSystem"
 import { dirname } from "node:path"
 import { Cause, Clock, Effect, FileSystem, Layer, Schedule, Context } from "effect"
-import { installRetentionSchema, checkpointPassive, mergeFts, retainBatch, repairSearchRows } from "./retention.js"
+import { installRetentionSchema, checkpointPassive, mergeFts, retainBatch, repairSearchRows, SPAN_SEARCH_MAPPING_READY_KEY } from "./retention.js"
 import { WriterDiagnostics } from "../ingestReadiness.ts"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
@@ -872,14 +872,21 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			query.run(...entries.flatMap(([key, value]) => [traceId, spanId, key, value]))
 		}
 		const deleteSpanOperationSearch = db.query(`DELETE FROM span_operation_fts WHERE trace_id = ? AND span_id = ?`)
+		const spanSearchMappingReady = hasRetention ? db.query("SELECT 1 FROM motel_maintenance WHERE key = ? AND value = 'complete'") : null
+		const deleteMappedSpanOperationSearch = hasRetention ? db.query(`DELETE FROM span_operation_fts WHERE rowid IN (
+			SELECT id FROM span_search_rows WHERE trace_id = ? AND span_id = ?
+		)`) : null
 		const insertSpanOperationSearch = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES (?, ?, ?)`)
 		const deleteSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
 		const insertSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
 		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
 			if (operations.length === 0) return
+			const mappedDelete = spanSearchMappingReady !== null && deleteMappedSpanOperationSearch !== null
+				&& spanSearchMappingReady.get(SPAN_SEARCH_MAPPING_READY_KEY) !== null ? deleteMappedSpanOperationSearch : null
 			if (operations.length === 1) {
 				const [traceId, spanId, operationName] = operations[0]!
-				deleteSpanOperationSearch.run(traceId, spanId)
+				if (mappedDelete !== null) mappedDelete.run(traceId, spanId)
+				else deleteSpanOperationSearch.run(traceId, spanId)
 				db.query("DELETE FROM span_search_rows WHERE trace_id = ? AND span_id = ?").run(traceId, spanId)
 				const result = insertSpanOperationSearch.run(traceId, spanId, operationName)
 				mapSpanSearch?.run(Number(result.lastInsertRowid), traceId, spanId)
@@ -891,7 +898,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				deleteQuery = db.query(`DELETE FROM span_operation_fts WHERE ${operations.map(() => "(trace_id = ? AND span_id = ?)").join(" OR ")}`)
 				deleteSpanOperationSearchManyByCount.set(operations.length, deleteQuery)
 			}
-			deleteQuery.run(...operations.flatMap(([traceId, spanId]) => [traceId, spanId]))
+			if (mappedDelete !== null) {
+				for (const [traceId, spanId] of operations) mappedDelete.run(traceId, spanId)
+			} else deleteQuery.run(...operations.flatMap(([traceId, spanId]) => [traceId, spanId]))
 			for (const [traceId, spanId] of operations) db.query("DELETE FROM span_search_rows WHERE trace_id = ? AND span_id = ?").run(traceId, spanId)
 
 			let insertQuery = insertSpanOperationSearchManyByCount.get(operations.length)
@@ -904,6 +913,13 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			const firstId = Number(result.lastInsertRowid) - operations.length + 1
 			for (const [index, [traceId, spanId]] of operations.entries()) mapSpanSearch?.run(firstId + index, traceId, spanId)
 		}
+		// An optional search-index failure must leave every FTS row mapped.
+		const updateSpanOperationSearch = db.transaction((operations: Parameters<typeof updateSpanOperationSearchMany>[0]) => {
+			const BATCH_SIZE = 500
+			for (let offset = 0; offset < operations.length; offset += BATCH_SIZE) {
+				updateSpanOperationSearchMany(operations.slice(offset, offset + BATCH_SIZE))
+			}
+		})
 		const insertLogAttribute = db.query(`INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`)
 		const logAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
 		const insertLogAttributesMany = (logId: number, attributes: Readonly<Record<string, string>>) => {
@@ -979,8 +995,8 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 					logs: config.otel.retentionLogBatch,
 					rows: config.otel.retentionRowBatch,
 				})
-				maintenancePending = result.pending && result.rows > 0
-				repairSearchRows(db, Math.min(100, config.otel.retentionRowBatch))
+				const spanMappingPending = repairSearchRows(db, Math.min(100, config.otel.retentionRowBatch))
+				maintenancePending = (result.pending && result.rows > 0) || spanMappingPending
 				mergeFts(db, 100)
 				checkpoint()
 			})
@@ -1114,12 +1130,9 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						}
 					}
 					try {
-						const BATCH_SIZE = 500
-						for (let offset = 0; offset < touchedOperations.length; offset += BATCH_SIZE) {
-							updateSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
-						}
+						updateSpanOperationSearch(touchedOperations)
 					} catch {
-						// FTS is optional.
+						// FTS is optional; its nested transaction restores the index and mapping together.
 					}
 					for (const traceId of touchedTraceIds) {
 						upsertTraceSummary.run(traceId)
