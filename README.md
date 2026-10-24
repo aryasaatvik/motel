@@ -110,8 +110,10 @@ and log exporter URLs default to that base with `v1/traces` and `v1/logs`.
 `motel start`, and the daemon the TUI launches, build the listen address
 from `MOTEL_OTEL_BASE_URL`, then `MOTEL_OTEL_QUERY_URL`, then
 `http://127.0.0.1:27686`. A missing port becomes 27686. The spawned server
-receives that listen address as its base URL, query URL, host, port,
-database path, and exporter URLs (the listen origin plus `/v1/traces` and `/v1/logs`).
+receives that listen address as its base URL, query URL, host, port, and
+exporter URLs (the listen origin plus `/v1/traces` and `/v1/logs`). The
+database file is resolved separately: `MOTEL_OTEL_DB_PATH`, or
+`telemetry.sqlite` in the runtime directory.
 
 Integer settings treat blank, non-numeric, and non-positive values as unset.
 `MOTEL_OTEL_QUERY_CAPACITY` is capped at 64 and
