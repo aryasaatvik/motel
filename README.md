@@ -90,11 +90,58 @@ The store retains seven days of telemetry by default and targets a 1 GB
 active-data ceiling using bounded background batches. Recent data is preserved while
 the oldest completed traces and logs are removed first. Configure the policy
 with `MOTEL_OTEL_RETENTION_HOURS`, `MOTEL_OTEL_MAX_DB_SIZE_MB`,
-`MOTEL_OTEL_RETENTION_TRACE_BATCH`, `MOTEL_OTEL_RETENTION_LOG_BATCH`, and
-`MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`. Existing databases created without
+`MOTEL_OTEL_RETENTION_TRACE_BATCH`, `MOTEL_OTEL_RETENTION_ROW_BATCH`,
+`MOTEL_OTEL_RETENTION_LOG_BATCH`, and
+`MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`.
+Existing databases created without
 incremental auto-vacuum are never silently rewritten at startup; deleted pages
 are reused, but shrinking such a historical file requires an explicit offline
 SQLite `VACUUM` chosen by the user.
+
+## Configuration
+
+Processes that load `src/config.ts` resolve one base URL, in order:
+`MOTEL_OTEL_BASE_URL`, `MOTEL_OTEL_QUERY_URL`, `MOTEL_OTEL_COLLECTOR_URL`,
+then `http://127.0.0.1:27686`. The query URL is that base URL. Host is
+`MOTEL_OTEL_HOST`, or the base URL hostname. Port is `MOTEL_OTEL_PORT` when
+it is a positive integer, otherwise the base URL port, otherwise 80. Trace
+and log exporter URLs default to that base with `v1/traces` and `v1/logs`.
+
+`motel start`, and the daemon the TUI launches, build the listen address
+from `MOTEL_OTEL_BASE_URL`, then `MOTEL_OTEL_QUERY_URL`, then
+`http://127.0.0.1:27686`. A missing port becomes 27686. The spawned server
+receives that listen address as its base URL, query URL, host, port,
+database path, and exporter URLs (the listen origin plus `/v1/traces` and `/v1/logs`).
+
+Integer settings treat blank, non-numeric, and non-positive values as unset.
+`MOTEL_OTEL_QUERY_CAPACITY` is capped at 64 and
+`MOTEL_OTEL_QUERY_DEADLINE_MS` at 30000.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MOTEL_OTEL_BASE_URL` | `http://127.0.0.1:27686` | Resolved base URL and query URL. First choice in the fallback above. |
+| `MOTEL_OTEL_QUERY_URL` | unset | Base URL when `MOTEL_OTEL_BASE_URL` is unset. The query URL equals the resolved base URL. |
+| `MOTEL_OTEL_COLLECTOR_URL` | unset | Base URL only when both URLs above are unset. The managed daemon leaves it unused. |
+| `MOTEL_OTEL_HOST` | base URL hostname (`127.0.0.1`) | Hostname the server binds. |
+| `MOTEL_OTEL_PORT` | base URL port (`27686`) | Port the server binds. `src/config.ts` uses 80 when the URL has no port; the managed daemon uses 27686. |
+| `MOTEL_OTEL_SERVICE_NAME` | `motel-otel-tui` | Name on motel's own exporter, and the CLI default service. A nonblank value is also the TUI's initial service. Blank keeps the remembered TUI service. |
+| `MOTEL_OTEL_ENABLED` | `false` | Export motel's own traces and logs from the TUI and CLI. Blank, `0`, `false`, `no`, and `off` stay off; any other value turns it on. |
+| `MOTEL_OTEL_EXPORTER_URL` | base URL + `/v1/traces` | Where that self-export posts spans. |
+| `MOTEL_OTEL_LOGS_EXPORTER_URL` | base URL + `/v1/logs` | Where that self-export posts logs. |
+| `MOTEL_RUNTIME_DIR` | `${XDG_STATE_HOME:-~/.local/state}/motel` | State directory: default database, daemon log, lock, and instance registry. |
+| `MOTEL_OTEL_DB_PATH` | `$MOTEL_RUNTIME_DIR/telemetry.sqlite` | SQLite file. One shared database per machine unless this is set. |
+| `MOTEL_URL` | unset | Base URL for the MCP client. When set, discovery uses it instead of the instance registry. |
+| `MOTEL_OTEL_TRACE_LOOKBACK_MINUTES` | `1440` | Age window, in minutes, for service discovery and for store queries that omit a lookback. HTTP list and search routes send their own `lookback` (default 60 minutes, maximum 1440). |
+| `MOTEL_OTEL_TRACE_LIMIT` | `100` | Trace count for the TUI and for CLI trace commands that omit a limit. HTTP list routes send their own `limit`. |
+| `MOTEL_OTEL_LOG_LIMIT` | `80` | Log count for TUI service logs, TUI trace logs, and CLI log commands. HTTP log routes send their own `limit`. |
+| `MOTEL_OTEL_QUERY_CAPACITY` | `8` (maximum 64) | Outstanding readonly queries per runtime. Overload is HTTP 503 `QUERY_OVERLOADED`. |
+| `MOTEL_OTEL_QUERY_DEADLINE_MS` | `5000` (maximum 30000) | Queue plus startup deadline for one readonly query. Expiry is HTTP 504 `QUERY_DEADLINE`. |
+| `MOTEL_OTEL_RETENTION_HOURS` | `168` | Age cutoff for completed traces and for logs. |
+| `MOTEL_OTEL_MAX_DB_SIZE_MB` | `1024` | Active-data target in MB: `(page_count - freelist_count) * page_size`. Not a hard file-size cap. |
+| `MOTEL_OTEL_RETENTION_TRACE_BATCH` | `100` | Completed traces marked per cleanup pass. |
+| `MOTEL_OTEL_RETENTION_ROW_BATCH` | `1000` | Rows deleted per cleanup pass, split across traces and logs. Bounds row count, not the size of one field. |
+| `MOTEL_OTEL_RETENTION_LOG_BATCH` | `5000` | Logs marked per cleanup pass. |
+| `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS` | `10` | Delay after an idle cleanup pass. Cleanup that is still making progress waits 100 ms. |
 
 ## How agents connect
 

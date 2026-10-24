@@ -130,27 +130,30 @@ The repo is wired up with `@effect/language-service` as a `tsconfig.json` `plugi
 - Health: `http://127.0.0.1:27686/api/health`
 
 ## Env Vars
-- `MOTEL_OTEL_ENABLED`: defaults to `false` (set to `true` to emit self-traces for debugging motel itself)
-- `MOTEL_OTEL_SERVICE_NAME`: defaults to `motel-otel-tui`; a nonblank explicit value also selects the initial TUI service, overriding the remembered selection (unset or blank values keep the remembered selection)
+Integer settings treat blank, non-numeric, and non-positive values as unset. `src/config.ts` resolves the base URL as `MOTEL_OTEL_BASE_URL`, then `MOTEL_OTEL_QUERY_URL`, then `MOTEL_OTEL_COLLECTOR_URL`, then `http://127.0.0.1:27686`. Host and port follow that URL unless set (`src/config.ts` uses port 80 when the URL has no port). The managed daemon in `src/daemon.ts` stops at `MOTEL_OTEL_QUERY_URL` and uses port 27686 when its URL has no port, then writes that listen address into the server's base URL, query URL, host, port, database path, and exporter URLs.
+- `MOTEL_OTEL_ENABLED`: defaults to `false`. Blank, `0`, `false`, `no`, and `off` stay off; any other value makes the TUI and CLI export motel's own traces and logs.
+- `MOTEL_OTEL_SERVICE_NAME`: defaults to `motel-otel-tui`. A nonblank value is the exporter service name, the CLI default service, and the initial TUI service. Blank keeps the remembered TUI service.
 - `MOTEL_OTEL_BASE_URL`: defaults to `http://127.0.0.1:27686`
-- `MOTEL_OTEL_HOST`: defaults to `127.0.0.1`
-- `MOTEL_OTEL_PORT`: defaults to `27686`
-- `MOTEL_OTEL_EXPORTER_URL`: defaults to `http://127.0.0.1:27686/v1/traces`
-- `MOTEL_OTEL_LOGS_EXPORTER_URL`: defaults to `http://127.0.0.1:27686/v1/logs`
-- `MOTEL_OTEL_QUERY_URL`: defaults to `http://127.0.0.1:27686`
-- `MOTEL_OTEL_DB_PATH`: defaults to `${XDG_STATE_HOME:-~/.local/state}/motel/telemetry.sqlite` (one shared DB per machine; daemon log + lock + instance registry live in the same directory)
-- `MOTEL_RUNTIME_DIR`: overrides the daemon log, lock, and instance-registry directory (primarily for isolated tests and custom managed instances)
-- `MOTEL_OTEL_TRACE_LOOKBACK_MINUTES`: defaults to `1440` (24h)
-- `MOTEL_OTEL_TRACE_LIMIT`: defaults to `100`
-- `MOTEL_OTEL_LOG_LIMIT`: defaults to `80`
+- `MOTEL_OTEL_QUERY_URL`: base URL fallback when `MOTEL_OTEL_BASE_URL` is unset. The configured query URL is the resolved base URL.
+- `MOTEL_OTEL_COLLECTOR_URL`: base URL fallback when both URLs above are unset. The managed daemon leaves it unused.
+- `MOTEL_OTEL_HOST`: defaults to the base URL hostname (`127.0.0.1`)
+- `MOTEL_OTEL_PORT`: defaults to the base URL port (`27686`; `80` from `src/config.ts` when the URL has no port)
+- `MOTEL_OTEL_EXPORTER_URL`: defaults to the base URL plus `v1/traces`
+- `MOTEL_OTEL_LOGS_EXPORTER_URL`: defaults to the base URL plus `v1/logs`
+- `MOTEL_RUNTIME_DIR`: defaults to `${XDG_STATE_HOME:-~/.local/state}/motel` (default database, daemon log, lock, and instance registry; primarily overridden for isolated tests and custom managed instances)
+- `MOTEL_OTEL_DB_PATH`: defaults to `$MOTEL_RUNTIME_DIR/telemetry.sqlite` (one shared DB per machine)
+- `MOTEL_URL`: when set, the MCP client uses this base URL instead of the instance registry
+- `MOTEL_OTEL_TRACE_LOOKBACK_MINUTES`: defaults to `1440` (24h) for service discovery and store queries that omit a lookback. HTTP list and search routes send their own `lookback` (default 60 minutes, maximum 1440).
+- `MOTEL_OTEL_TRACE_LIMIT`: defaults to `100` for the TUI and CLI. HTTP list routes send their own `limit`.
+- `MOTEL_OTEL_LOG_LIMIT`: defaults to `80` for TUI service logs, TUI trace logs, and CLI log commands. HTTP log routes send their own `limit`.
 - `MOTEL_OTEL_RETENTION_HOURS`: defaults to `168` (7d)
-- `MOTEL_OTEL_MAX_DB_SIZE_MB`: defaults to `1024` (size-based retention cap)
-- `MOTEL_OTEL_RETENTION_TRACE_BATCH`: defaults to `100` completed traces per cleanup pass
-- `MOTEL_OTEL_RETENTION_LOG_BATCH`: defaults to `5000` logs per cleanup pass
+- `MOTEL_OTEL_MAX_DB_SIZE_MB`: defaults to `1024` (active-data target, not a hard file cap)
+- `MOTEL_OTEL_RETENTION_TRACE_BATCH`: defaults to `100` completed traces marked per cleanup pass
+- `MOTEL_OTEL_RETENTION_LOG_BATCH`: defaults to `5000` logs marked per cleanup pass
 - `MOTEL_OTEL_QUERY_CAPACITY`: defaults to `8` outstanding queries per runtime (maximum `64`)
 - `MOTEL_OTEL_QUERY_DEADLINE_MS`: defaults to `5000` including queue and startup time (maximum `30000`)
-- `MOTEL_OTEL_RETENTION_ROW_BATCH`: defaults to `1000` physical rows per cleanup pass
-- `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`: defaults to `10`
+- `MOTEL_OTEL_RETENTION_ROW_BATCH`: defaults to `1000` rows deleted per cleanup pass, split across traces and logs. Bounds row count, not the size of one field.
+- `MOTEL_OTEL_RETENTION_INTERVAL_SECONDS`: defaults to `10` after an idle pass. Cleanup that is still making progress waits 100 ms.
 
 ## TUI Keys
 - `?`: toggle shortcut help
