@@ -1,3 +1,9 @@
+## @aryasaatvik/motel@0.5.3
+
+### Require Bun 1.4.4
+
+Require Bun 1.4.4 or newer to run Motel, and select Bun 1.4.4 for repository and release tooling.
+
 ## @aryasaatvik/motel@0.5.2
 
 ### Keep trace ingestion fast as history grows

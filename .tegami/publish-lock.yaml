@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n## Keep trace ingestion fast as history grows\n\nUse indexed row mappings to replace span operation search entries without scanning retained history. Existing databases repair their mappings before enabling this path, and failed search-index updates roll back atomically.\n"
-    filename: trace-search-ingestion.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Require Bun 1.4.4\n\nRequire Bun 1.4.4 or newer to run Motel, and select Bun 1.4.4 for repository and release tooling.\n"
+    filename: bun-1-4-4.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - trace-search-ingestion.md
+      - bun-1-4-4.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
