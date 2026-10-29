@@ -72,6 +72,17 @@ writing or loading the LaunchAgent. Re-running it leaves an equivalent loaded
 service unchanged and loads an equivalent definition that is currently
 unloaded.
 
+Retention settings (the `MOTEL_OTEL_RETENTION_*` and
+`MOTEL_OTEL_MAX_DB_SIZE_MB` variables) set in the install environment are
+written into the LaunchAgent. A replacement keeps installed retention values
+that the install environment does not set, and `motel service status` reports
+a requested value that differs from the installed one as
+`EnvironmentVariables.<name>` drift:
+
+```bash
+MOTEL_OTEL_MAX_DB_SIZE_MB=4096 motel service install --replace
+```
+
 ## How your app connects
 
 Once motel is running, point your app's OTLP/HTTP exporters at these

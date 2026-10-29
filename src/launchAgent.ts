@@ -71,7 +71,26 @@ const xmlArray = (values: readonly string[]) => `<array>\n${values.map((value) =
 
 const xmlEnvironment = (environment: Readonly<Record<string, string>>) => `<dict>\n${Object.entries(environment).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `      <key>${xmlEscape(key)}</key>\n      ${xmlString(value)}`).join("\n")}\n    </dict>`
 
-export const buildLaunchAgentSpec = (options: { readonly home?: string; readonly stateDirectory?: string } = {}): LaunchAgentSpec => {
+/** Retention knobs read by `src/config.ts`. The service gets them only when set, so unset keys keep config defaults. */
+export const LAUNCH_AGENT_RETENTION_KEYS = [
+	"MOTEL_OTEL_MAX_DB_SIZE_MB",
+	"MOTEL_OTEL_RETENTION_HOURS",
+	"MOTEL_OTEL_RETENTION_INTERVAL_SECONDS",
+	"MOTEL_OTEL_RETENTION_LOG_BATCH",
+	"MOTEL_OTEL_RETENTION_ROW_BATCH",
+	"MOTEL_OTEL_RETENTION_TRACE_BATCH",
+] as const
+
+const isRetentionKey = (key: string) => (LAUNCH_AGENT_RETENTION_KEYS as readonly string[]).includes(key)
+
+const retentionEnvironment = (environment: NodeJS.ProcessEnv) => Object.fromEntries(
+	LAUNCH_AGENT_RETENTION_KEYS.flatMap((key) => {
+		const value = environment[key]?.trim()
+		return value ? [[key, value]] : []
+	}),
+)
+
+export const buildLaunchAgentSpec = (options: { readonly home?: string; readonly stateDirectory?: string; readonly environment?: NodeJS.ProcessEnv } = {}): LaunchAgentSpec => {
 	const home = options.home ?? os.homedir()
 	const workingDirectory = options.stateDirectory ?? path.join(home, ".local", "state", "motel")
 	const bunDirectory = path.join(home, ".bun", "bin")
@@ -94,6 +113,7 @@ export const buildLaunchAgentSpec = (options: { readonly home?: string; readonly
 			MOTEL_OTEL_QUERY_URL: "http://127.0.0.1:27686",
 			MOTEL_RUNTIME_DIR: workingDirectory,
 			PATH: `${bunDirectory}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+			...retentionEnvironment(options.environment ?? process.env),
 		},
 		runAtLoad: true,
 		keepAlive: true,
@@ -201,7 +221,14 @@ export const compareLaunchAgent = (inspection: LaunchAgentInspection, spec: Laun
 	if (value.KeepAlive !== true) fields.push("KeepAlive")
 	if (value.ProcessType !== spec.processType) fields.push("ProcessType")
 	const environment = asRecord(value.EnvironmentVariables)
-	if (environment === null || Object.entries(spec.environment).some(([key, expected]) => environment[key] !== expected)) fields.push("EnvironmentVariables")
+	const expectedEnvironment = Object.entries(spec.environment)
+	if (environment === null || expectedEnvironment.some(([key, expected]) => !isRetentionKey(key) && environment[key] !== expected)) fields.push("EnvironmentVariables")
+	// Retention keys absent from the spec were not requested, so an installed value is accepted as is.
+	if (environment !== null) {
+		for (const [key, expected] of expectedEnvironment) {
+			if (isRetentionKey(key) && environment[key] !== expected) fields.push(`EnvironmentVariables.${key}`)
+		}
+	}
 	return fields.length === 0 ? { kind: "equivalent" } : { kind: "divergent", fields }
 }
 
@@ -253,6 +280,22 @@ const readInspection = async (operations: LaunchAgentOperations, spec: LaunchAge
 	const result = await optional(operations, "plutil", ["-convert", "json", "-o", "-", spec.plistPath])
 	if (result.exitCode !== 0) return { kind: "malformed", message: result.stderr.trim() || result.stdout.trim() || "plutil could not parse the plist." }
 	return inspectLaunchAgentJson(result.stdout)
+}
+
+/** Carries installed retention values forward unless the install environment sets them. */
+const withInstalledRetention = (spec: LaunchAgentSpec, inspection: LaunchAgentInspection): LaunchAgentSpec => {
+	const installed = inspection.kind === "valid" ? asRecord(inspection.value.EnvironmentVariables) : null
+	if (installed === null) return spec
+	const carried = Object.fromEntries(LAUNCH_AGENT_RETENTION_KEYS.flatMap((key) => {
+		const value = installed[key]
+		return typeof value === "string" && !(key in spec.environment) ? [[key, value]] : []
+	}))
+	return { ...spec, environment: { ...spec.environment, ...carried } }
+}
+
+const requireValidRetention = (spec: LaunchAgentSpec) => {
+	const invalid = LAUNCH_AGENT_RETENTION_KEYS.filter((key) => key in spec.environment && !/^[1-9]\d*$/.test(spec.environment[key]!))
+	if (invalid.length > 0) throw new LaunchAgentError(`Cannot install Motel service: ${invalid.join(", ")} must be a positive integer.`)
 }
 
 const writeAtomically = async (operations: LaunchAgentOperations, spec: LaunchAgentSpec) => {
@@ -350,8 +393,10 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 	})
 	const install = (replace: boolean) => Effect.tryPromise({
 		try: async () => {
+			requireValidRetention(spec)
 			const inspection = await readInspection(operations, spec)
-			const comparison = compareLaunchAgent(inspection, spec)
+			const target = withInstalledRetention(spec, inspection)
+			const comparison = compareLaunchAgent(inspection, target)
 			if (comparison.kind === "malformed" && !replace) throw new LaunchAgentError(`Existing service plist is malformed: ${comparison.message}. Re-run with --replace to replace it.`)
 			if (comparison.kind === "divergent" && inspection.kind !== "missing" && !replace) throw new LaunchAgentError(`Existing service plist diverges in ${comparison.fields.join(", ")}. Re-run with --replace to replace it.`)
 			const manager = requireKnownLaunchctlState(launchctlState(await optional(operations, "launchctl", ["print", spec.target])))
@@ -367,7 +412,7 @@ export const createLaunchAgentManager = (spec = buildLaunchAgentSpec(), supplied
 			if (manager === "loaded" && !replace) throw new LaunchAgentError("Motel has a loaded LaunchAgent job that does not match the requested install state. Re-run with --replace to boot it out before installing.")
 			if (manager === "loaded") await required(operations, "launchctl", ["bootout", spec.target])
 			await operations.mkdir(spec.workingDirectory)
-			await writeAtomically(operations, spec)
+			await writeAtomically(operations, target)
 			await required(operations, "launchctl", ["bootstrap", spec.domain, spec.plistPath])
 			await required(operations, "launchctl", ["enable", spec.target])
 			await required(operations, "launchctl", ["kickstart", "-k", spec.target])

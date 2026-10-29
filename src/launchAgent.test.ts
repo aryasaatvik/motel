@@ -7,13 +7,23 @@ import {
 	createLaunchAgentManager,
 	createMotelLifecycle,
 	inspectLaunchAgentJson,
+	LAUNCH_AGENT_RETENTION_KEYS,
 	renderLaunchAgentPlist,
 	usesLaunchAgentRuntime,
 	type LaunchAgentManager,
 	type LaunchAgentOperations,
+	type LaunchAgentSpec,
 } from "./launchAgent.js"
 
-const spec = buildLaunchAgentSpec({ home: "/Users/motel-test" })
+const spec = buildLaunchAgentSpec({ home: "/Users/motel-test", environment: {} })
+
+const retentionSpec = (environment: NodeJS.ProcessEnv) => buildLaunchAgentSpec({ home: "/Users/motel-test", environment })
+
+// Reads EnvironmentVariables back out of a rendered plist so installs round-trip through the harness.
+const renderedEnvironment = (xml: string) => Object.fromEntries(
+	[...xml.split("<key>EnvironmentVariables</key>")[1]!.split("</dict>")[0]!.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)]
+		.map(([, key, value]) => [key!, value!]),
+)
 
 const plistValue = () => ({
 	Label: spec.label,
@@ -45,7 +55,7 @@ const daemonStatus = (overrides: Partial<DaemonStatus> = {}): DaemonStatus => ({
 	...overrides,
 })
 
-const makeHarness = (options: { readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus; readonly readyAfter?: number } = {}) => {
+const makeHarness = (options: { readonly spec?: LaunchAgentSpec; readonly installed?: boolean; readonly missingExecutables?: readonly string[]; readonly plist?: Record<string, unknown>; readonly plutilExitCode?: number; readonly launchctlPrintExitCode?: number; readonly launchctlPrintStderr?: string; readonly bootoutExitCode?: number; readonly health?: DaemonStatus; readonly readyAfter?: number } = {}) => {
 	let installed = options.installed ?? false
 	let plist = options.plist ?? plistValue()
 	let launchctlPrintExitCode = options.launchctlPrintExitCode ?? 113
@@ -59,7 +69,14 @@ const makeHarness = (options: { readonly installed?: boolean; readonly missingEx
 		readFile: async (file) => files.get(file) ?? "",
 		mkdir: async () => {},
 		writeFile: async (file, contents) => { fileEvents.push("write"); files.set(file, contents) },
-		rename: async (_from, to) => { fileEvents.push("rename"); if (to === spec.plistPath) { installed = true; plist = plistValue() } },
+		rename: async (from, to) => {
+			fileEvents.push("rename")
+			if (to === spec.plistPath) {
+				installed = true
+				plist = { ...plistValue(), EnvironmentVariables: renderedEnvironment(files.get(from) ?? "") }
+				files.set(to, files.get(from) ?? "")
+			}
+		},
 		unlink: async (file) => { fileEvents.push("unlink"); if (file === spec.plistPath) installed = false; files.delete(file) },
 		run: async (command, args) => {
 			calls.push([command, ...args])
@@ -77,7 +94,7 @@ const makeHarness = (options: { readonly installed?: boolean; readonly missingEx
 		probeDaemonIngest: async () => ++probeCalls > (options.readyAfter ?? 0),
 		version: "0.2.6",
 	}
-	return { calls, fileEvents, get probeCalls() { return probeCalls }, manager: createLaunchAgentManager(spec, operations) }
+	return { calls, fileEvents, get probeCalls() { return probeCalls }, get written() { return files.get(spec.plistPath) }, manager: createLaunchAgentManager(options.spec ?? spec, operations) }
 }
 
 describe("LaunchAgent specification", () => {
@@ -97,6 +114,90 @@ describe("LaunchAgent specification", () => {
 		const divergent = inspectLaunchAgentJson(JSON.stringify({ ...plistValue(), KeepAlive: false }))
 		expect(compareLaunchAgent(divergent, spec)).toEqual({ kind: "divergent", fields: ["KeepAlive"] })
 		expect(compareLaunchAgent(inspectLaunchAgentJson("not json"), spec).kind).toBe("malformed")
+	})
+})
+
+describe("LaunchAgent retention settings", () => {
+	test("passes set retention knobs through and leaves unset ones to config defaults", () => {
+		const configured = retentionSpec({
+			MOTEL_OTEL_MAX_DB_SIZE_MB: " 4096 ",
+			MOTEL_OTEL_RETENTION_HOURS: "72",
+			MOTEL_OTEL_RETENTION_LOG_BATCH: "",
+			MOTEL_OTEL_QUERY_CAPACITY: "16",
+		})
+		expect(Object.keys(configured.environment).filter((key) => (LAUNCH_AGENT_RETENTION_KEYS as readonly string[]).includes(key))).toEqual(["MOTEL_OTEL_MAX_DB_SIZE_MB", "MOTEL_OTEL_RETENTION_HOURS"])
+		expect(configured.environment.MOTEL_OTEL_MAX_DB_SIZE_MB).toBe("4096")
+		expect(configured.environment.MOTEL_OTEL_QUERY_CAPACITY).toBeUndefined()
+		expect(renderLaunchAgentPlist(configured)).toContain("<key>MOTEL_OTEL_MAX_DB_SIZE_MB</key>\n      <string>4096</string>")
+	})
+
+	test("covers every retention knob read by config", async () => {
+		const source = await Bun.file(new URL("./config.ts", import.meta.url)).text()
+		const configured = [...source.matchAll(/process\.env\.(MOTEL_OTEL_(?:RETENTION_[A-Z_]+|MAX_DB_SIZE_MB))/g)].map(([, key]) => key)
+		expect<string[]>([...LAUNCH_AGENT_RETENTION_KEYS].sort()).toEqual([...new Set(configured)].sort())
+	})
+
+	test("reports requested retention values that the installed plist lacks or contradicts", () => {
+		const requested = retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4096", MOTEL_OTEL_RETENTION_HOURS: "72" })
+		const installed = inspectLaunchAgentJson(JSON.stringify({ ...plistValue(), EnvironmentVariables: { ...spec.environment, MOTEL_OTEL_MAX_DB_SIZE_MB: "2048" } }))
+		expect(compareLaunchAgent(installed, requested)).toEqual({
+			kind: "divergent",
+			fields: ["EnvironmentVariables.MOTEL_OTEL_MAX_DB_SIZE_MB", "EnvironmentVariables.MOTEL_OTEL_RETENTION_HOURS"],
+		})
+	})
+
+	test("accepts installed retention values the caller did not request", () => {
+		const installed = inspectLaunchAgentJson(JSON.stringify({ ...plistValue(), EnvironmentVariables: { ...spec.environment, MOTEL_OTEL_MAX_DB_SIZE_MB: "4096" } }))
+		expect(compareLaunchAgent(installed, spec)).toEqual({ kind: "equivalent" })
+	})
+
+	test("status reports a retention mismatch as configuration drift", async () => {
+		const requested = retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4096" })
+		const harness = makeHarness({ spec: requested, installed: true, launchctlPrintExitCode: 0 })
+		const status = await Effect.runPromise(harness.manager.status)
+		expect(status.installed).toBe(false)
+		expect(status.configuration).toBe("divergent")
+		expect(status.configurationDetails).toEqual(["EnvironmentVariables.MOTEL_OTEL_MAX_DB_SIZE_MB"])
+	})
+
+	test("install writes retention values set in the install environment", async () => {
+		const harness = makeHarness({ spec: retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4096", MOTEL_OTEL_RETENTION_HOURS: "72" }) })
+		const status = await Effect.runPromise(harness.manager.install(false))
+		expect(status.installed).toBe(true)
+		expect(renderedEnvironment(harness.written!)).toMatchObject({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4096", MOTEL_OTEL_RETENTION_HOURS: "72" })
+	})
+
+	test("replacing a divergent plist keeps installed retention values the environment does not set", async () => {
+		const harness = makeHarness({
+			installed: true,
+			launchctlPrintExitCode: 0,
+			plist: { ...plistValue(), ProcessType: "Interactive", EnvironmentVariables: { ...spec.environment, MOTEL_OTEL_MAX_DB_SIZE_MB: "4096", MOTEL_OTEL_RETENTION_HOURS: "72" } },
+		})
+		await Effect.runPromise(harness.manager.install(true))
+		expect(renderedEnvironment(harness.written!)).toMatchObject({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4096", MOTEL_OTEL_RETENTION_HOURS: "72" })
+	})
+
+	test("an install-time value replaces the installed one only with replace", async () => {
+		const plist = { ...plistValue(), EnvironmentVariables: { ...spec.environment, MOTEL_OTEL_MAX_DB_SIZE_MB: "4096" } }
+		const refused = makeHarness({ spec: retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "8192" }), installed: true, launchctlPrintExitCode: 0, plist })
+		await expect(Effect.runPromise(refused.manager.install(false))).rejects.toThrow("EnvironmentVariables.MOTEL_OTEL_MAX_DB_SIZE_MB")
+		expect(refused.fileEvents).toEqual([])
+		const replaced = makeHarness({ spec: retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "8192" }), installed: true, launchctlPrintExitCode: 0, plist })
+		await Effect.runPromise(replaced.manager.install(true))
+		expect(renderedEnvironment(replaced.written!).MOTEL_OTEL_MAX_DB_SIZE_MB).toBe("8192")
+	})
+
+	test("an equivalent install with no retention environment leaves the installed values untouched", async () => {
+		const harness = makeHarness({ installed: true, launchctlPrintExitCode: 0, plist: { ...plistValue(), EnvironmentVariables: { ...spec.environment, MOTEL_OTEL_MAX_DB_SIZE_MB: "4096" } } })
+		await Effect.runPromise(harness.manager.install(false))
+		expect(harness.fileEvents).toEqual([])
+	})
+
+	test("rejects a non-integer retention value before touching launchd", async () => {
+		const harness = makeHarness({ spec: retentionSpec({ MOTEL_OTEL_MAX_DB_SIZE_MB: "4gb" }) })
+		await expect(Effect.runPromise(harness.manager.install(false))).rejects.toThrow("MOTEL_OTEL_MAX_DB_SIZE_MB must be a positive integer")
+		expect(harness.calls).toEqual([])
+		expect(harness.fileEvents).toEqual([])
 	})
 })
 
