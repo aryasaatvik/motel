@@ -830,11 +830,17 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		if (!opts.readonly) {
 			installRetentionSchema(db)
 			db.exec("CREATE INDEX IF NOT EXISTS idx_spans_roots ON spans(trace_id, start_time_ms) WHERE parent_span_id IS NULL")
+			// AI-call queries seek this instead of reading every span in the lookback window.
+			db.exec("CREATE INDEX IF NOT EXISTS idx_spans_ai_time ON spans(start_time_ms DESC) WHERE operation_name LIKE 'ai.%'")
 		}
 		const hasRetention = db.query("SELECT 1 FROM sqlite_master WHERE name = 'retained_spans'").get() !== null
 		const spanSource = hasRetention ? "retained_spans" : "spans"
 		const logSource = hasRetention ? "retained_logs" : "logs"
 		const traceSource = hasRetention ? "retained_trace_summaries" : "trace_summaries"
+		// A reader can open a store whose writer predates the index; it keeps the unindexed source.
+		// INDEXED BY cannot name a view, so the indexed source repeats the retained_spans filter.
+		const hasAiIndex = db.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_spans_ai_time'").get() !== null
+		const aiSpanSource = hasAiIndex ? "spans AS s INDEXED BY idx_spans_ai_time" : `${spanSource} AS s`
 		const evictingTrace = hasRetention ? db.query("SELECT 1 FROM retention_traces WHERE trace_id = ?") : null
 		const mapSpanSearch = hasRetention ? db.query("INSERT OR REPLACE INTO span_search_rows VALUES (?, ?, ?)") : null
 		const mapLogSearch = hasRetention ? db.query("INSERT OR REPLACE INTO log_search_rows VALUES (?, ?)") : null
@@ -2089,11 +2095,13 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		/** Builds WHERE clauses for AI call search against the spans table (aliased as s) */
 		const buildAiWhereClauses = (input: AiCallSearch | AiCallStatsSearch, cutoff: number) => {
 			const clauses: string[] = [
+				// Must match idx_spans_ai_time's WHERE term exactly for the planner to use it.
 				"s.operation_name LIKE 'ai.%'",
 				"s.operation_name NOT LIKE 'ai.%.do%'",
 				"s.start_time_ms >= ?",
 			]
 			const params: Array<string | number> = [cutoff]
+			if (hasAiIndex && hasRetention) clauses.push("NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = s.trace_id)")
 
 			if (input.service) {
 				clauses.push("s.service_name = ?")
@@ -2190,7 +2198,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 
 				const rows = db.query(`
 					SELECT s.trace_id, s.span_id, s.service_name, s.operation_name, s.start_time_ms, s.duration_ms, s.status
-					FROM ${spanSource} AS s
+					FROM ${aiSpanSource}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY s.start_time_ms DESC
 					LIMIT ?
@@ -2374,7 +2382,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				if (input.groupBy === "status") {
 					const rows = db.query(`
 						SELECT s.status AS grp, COUNT(*) AS count, AVG(s.duration_ms) AS avg_dur
-						FROM ${spanSource} AS s
+						FROM ${aiSpanSource}
 						WHERE ${clauses.join(" AND ")}
 						GROUP BY s.status
 						ORDER BY count DESC
@@ -2401,7 +2409,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						s.span_id,
 						s.duration_ms,
 						s.status
-					FROM ${spanSource} AS s
+					FROM ${aiSpanSource}
 					LEFT JOIN span_attributes AS ga
 						ON ga.trace_id = s.trace_id AND ga.span_id = s.span_id AND ga.key = ?
 					WHERE ${clauses.join(" AND ")}
