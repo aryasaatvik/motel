@@ -1503,4 +1503,15 @@ describe("motel telemetry store", () => {
 		expect(expected.length).toBeGreaterThan(0)
 		expect(JSON.parse(stdout.trim().split("\n").at(-1)!)).toEqual(expected.map((call) => call.spanId))
 	})
+
+	it("scopes AI calls to one trace through the trace lookup", async () => {
+		const [all, unknown] = await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			return [yield* store.searchAiCalls({}), yield* store.searchAiCalls({ traceId: "no-such-ai-trace" })] as const
+		}))
+		const traceId = all[0]!.traceId
+		const scoped = await storeRuntime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.searchAiCalls({ traceId })))
+		expect(scoped.map((call) => call.spanId)).toEqual(all.filter((call) => call.traceId === traceId).map((call) => call.spanId))
+		expect(unknown).toEqual([])
+	})
 })

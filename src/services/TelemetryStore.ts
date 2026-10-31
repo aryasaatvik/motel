@@ -838,9 +838,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		const logSource = hasRetention ? "retained_logs" : "logs"
 		const traceSource = hasRetention ? "retained_trace_summaries" : "trace_summaries"
 		// A reader can open a store whose writer predates the index; it keeps the unindexed source.
-		// INDEXED BY cannot name a view, so the indexed source repeats the retained_spans filter.
 		const hasAiIndex = db.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_spans_ai_time'").get() !== null
-		const aiSpanSource = hasAiIndex ? "spans AS s INDEXED BY idx_spans_ai_time" : `${spanSource} AS s`
 		const evictingTrace = hasRetention ? db.query("SELECT 1 FROM retention_traces WHERE trace_id = ?") : null
 		const mapSpanSearch = hasRetention ? db.query("INSERT OR REPLACE INTO span_search_rows VALUES (?, ?, ?)") : null
 		const mapLogSearch = hasRetention ? db.query("INSERT OR REPLACE INTO log_search_rows VALUES (?, ?)") : null
@@ -2101,7 +2099,12 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				"s.start_time_ms >= ?",
 			]
 			const params: Array<string | number> = [cutoff]
-			if (hasAiIndex && hasRetention) clauses.push("NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = s.trace_id)")
+			// A trace filter is better served by idx_spans_trace_time, so only broader searches
+			// force the AI index. INDEXED BY cannot name a view, so that source repeats the
+			// retained_spans filter.
+			const indexed = hasAiIndex && !input.traceId
+			const source = indexed ? "spans AS s INDEXED BY idx_spans_ai_time" : `${spanSource} AS s`
+			if (indexed && hasRetention) clauses.push("NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = s.trace_id)")
 
 			if (input.service) {
 				clauses.push("s.service_name = ?")
@@ -2159,7 +2162,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 				}
 			}
 
-			return { clauses, params }
+			return { source, clauses, params }
 		}
 
 		/** Load attribute values for a set of spans by key */
@@ -2194,11 +2197,11 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			const limit = input.limit ?? 20
 
 			return yield* Effect.sync(() => {
-				const { clauses, params } = buildAiWhereClauses(input, cutoff)
+				const { source, clauses, params } = buildAiWhereClauses(input, cutoff)
 
 				const rows = db.query(`
 					SELECT s.trace_id, s.span_id, s.service_name, s.operation_name, s.start_time_ms, s.duration_ms, s.status
-					FROM ${aiSpanSource}
+					FROM ${source}
 					WHERE ${clauses.join(" AND ")}
 					ORDER BY s.start_time_ms DESC
 					LIMIT ?
@@ -2376,13 +2379,13 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			const limit = input.limit ?? 20
 
 			return yield* Effect.sync(() => {
-				const { clauses, params } = buildAiWhereClauses(input, cutoff)
+				const { source, clauses, params } = buildAiWhereClauses(input, cutoff)
 
 				// For status groupBy, we can do it purely from the spans table
 				if (input.groupBy === "status") {
 					const rows = db.query(`
 						SELECT s.status AS grp, COUNT(*) AS count, AVG(s.duration_ms) AS avg_dur
-						FROM ${aiSpanSource}
+						FROM ${source}
 						WHERE ${clauses.join(" AND ")}
 						GROUP BY s.status
 						ORDER BY count DESC
@@ -2409,7 +2412,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						s.span_id,
 						s.duration_ms,
 						s.status
-					FROM ${aiSpanSource}
+					FROM ${source}
 					LEFT JOIN span_attributes AS ga
 						ON ga.trace_id = s.trace_id AND ga.span_id = s.span_id AND ga.key = ?
 					WHERE ${clauses.join(" AND ")}
