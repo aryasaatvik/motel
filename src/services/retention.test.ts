@@ -317,3 +317,33 @@ test("malformed persistent span migration state fails without resetting its curs
 		} finally { db.close() }
 	}
 })
+
+test("size eviction takes the oldest telemetry first across traces and logs", () => {
+	const db = new Database(":memory:")
+	try {
+		schema(db)
+		db.transaction(() => {
+			for (let index = 0; index < 30; index++) {
+				const trace = `t${index}`
+				db.query("INSERT INTO trace_summaries VALUES (?, ?, ?, 0)").run(trace, 1000 + index * 10, 1001 + index * 10)
+				db.query("INSERT INTO spans(trace_id, span_id, start_time_ms, end_time_ms) VALUES (?, 's', ?, ?)").run(trace, 1000 + index * 10, 1001 + index * 10)
+			}
+			for (let index = 0; index < 5; index++) db.query("INSERT INTO logs VALUES (?, NULL, ?, 'INFO')").run(index + 1, 500 + index)
+			for (let index = 0; index < 5; index++) db.query("INSERT INTO logs VALUES (?, NULL, ?, 'ERROR')").run(index + 100, 5000 + index)
+		})()
+		const sized = { ...options, cutoff: 0, maxBytes: 0, traces: 3, logs: 3 }
+		retainBatch(db, sized)
+		// Logs older than every trace go before any trace.
+		expect(count(db, "retention_traces")).toBe(0)
+		let passes = 0
+		while (count(db, "trace_summaries") > 0 && passes++ < 100) {
+			retainBatch(db, sized)
+			// Fresh logs outlive every older trace.
+			expect(count(db, "retained_logs WHERE timestamp_ms >= 5000")).toBe(5)
+		}
+		expect(passes).toBeLessThan(100)
+		expect(count(db, "logs WHERE timestamp_ms < 5000")).toBe(0)
+		while (count(db, "logs") > 0 && passes++ < 200) retainBatch(db, sized)
+		expect(count(db, "logs")).toBe(0)
+	} finally { db.close() }
+})
