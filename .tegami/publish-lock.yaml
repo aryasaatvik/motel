@@ -1,14 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep facet queries inside the query deadline on large stores\n\nThe log service facet now counts through an index instead of reading every log in the lookback window. The attribute-key picker ranks keys over the newest 500 traces in the window instead of every trace. On a 4 GB store these took 5 s and 10–43 s; they now take tens of milliseconds and no longer hold up searches queued behind them.\n"
-    filename: bounded-facets.md
-    v: 0.0.0
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep the query process warm when a client gives up\n\nA client that disconnects or times out no longer kills Motel's readonly query process. The query finishes within its deadline, and the next request reuses the warm process. Before, a client with a short timeout could start a cascade in which every following search paid a cold restart and timed out in turn. Only a query that overruns `MOTEL_OTEL_QUERY_DEADLINE_MS` still restarts the process.\n"
-    filename: query-warm-on-abort.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Index AI spans for AI-call queries\n\nAI-call search and stats now seek a partial index over `ai.*` spans instead of reading every span in the lookback window. On a 4 GB store with no AI traffic, `/api/ai/calls` took 6 s and could hold up searches queued behind it. The first start on this version builds the index once, which briefly holds the write lock while it reads span operation names.\n"
+    filename: ai-calls-index.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - bounded-facets.md
-      - query-warm-on-abort.md
+      - ai-calls-index.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
