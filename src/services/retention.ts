@@ -89,12 +89,27 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 			AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = trace_summaries.trace_id AND (s.end_time_ms <= 0 OR s.end_time_ms < s.start_time_ms))
 			ORDER BY ended_at_ms, trace_id LIMIT ?`).run(options.cutoff, slots)
 		if (oversized) {
+			// Size eviction takes the oldest telemetry first: traces wait while unmarked logs are older.
 			const remaining = Math.max(0, options.traces - (db.query("SELECT count(*) AS n FROM retention_traces").get() as { n: number }).n)
+			const oldestLog = db.query(`SELECT timestamp_ms FROM logs WHERE NOT EXISTS (SELECT 1 FROM retention_logs d WHERE d.id = logs.id)
+				ORDER BY timestamp_ms, id LIMIT 1`).get() as { timestamp_ms: number } | null
 			db.query(`INSERT OR IGNORE INTO retention_traces SELECT trace_id FROM trace_summaries
-				WHERE active_span_count = 0 AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = trace_summaries.trace_id)
+				WHERE active_span_count = 0 AND started_at_ms <= ? AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = trace_summaries.trace_id)
 				AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = trace_summaries.trace_id AND (s.end_time_ms <= 0 OR s.end_time_ms < s.start_time_ms))
-				ORDER BY started_at_ms, trace_id LIMIT ?`).run(remaining)
+				ORDER BY started_at_ms, trace_id LIMIT ?`).run(oldestLog?.timestamp_ms ?? Number.MAX_SAFE_INTEGER, remaining)
 		}
+	}
+	// Logs are size-evicted only up to the trace frontier: the newest marked trace or, past it,
+	// the oldest trace still eligible. With no evictable trace, every log is eligible.
+	const sizeCutoff = () => {
+		const marked = (db.query(`SELECT max(t.started_at_ms) AS at FROM retention_traces r
+			JOIN trace_summaries t ON t.trace_id = r.trace_id`).get() as { at: number | null }).at
+		const next = (db.query(`SELECT started_at_ms AS at FROM trace_summaries
+			WHERE active_span_count = 0 AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = trace_summaries.trace_id)
+			AND NOT EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = trace_summaries.trace_id AND (s.end_time_ms <= 0 OR s.end_time_ms < s.start_time_ms))
+			ORDER BY started_at_ms, trace_id LIMIT 1`).get() as { at: number } | null)?.at ?? null
+		if (marked === null && next === null) return Number.MAX_SAFE_INTEGER
+		return Math.max(marked ?? -Infinity, next ?? -Infinity) + 1
 	}
 	const traceIds = db.query("SELECT trace_id FROM retention_traces ORDER BY trace_id LIMIT ?").all(options.traces) as { trace_id: string }[]
 	// Correlated logs share trace visibility, including logs that have not yet been selected.
@@ -107,7 +122,7 @@ export const retainBatch = (db: Database, options: RetentionOptions) => db.trans
 	const available = Math.max(0, options.logs - (db.query("SELECT count(*) AS n FROM retention_logs").get() as { n: number }).n)
 	db.query(`INSERT OR IGNORE INTO retention_logs SELECT id FROM logs WHERE timestamp_ms < ?
 		AND NOT EXISTS (SELECT 1 FROM retention_logs d WHERE d.id = logs.id)
-		ORDER BY timestamp_ms, id LIMIT ?`).run(oversized ? Number.MAX_SAFE_INTEGER : options.cutoff, available)
+		ORDER BY timestamp_ms, id LIMIT ?`).run(oversized ? Math.max(options.cutoff, sizeCutoff()) : options.cutoff, available)
 
 	let remaining = options.rows
 	const remove = (sql: string, ...params: (string | number)[]) => {
