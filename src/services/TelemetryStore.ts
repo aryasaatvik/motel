@@ -183,6 +183,8 @@ const parseSummaryRow = (row: TraceSummaryRow): TraceSummaryItem => ({
 // simply don't appear in the picker, which is the desired behaviour: you'd
 // never want to filter traces by exact-match on a 1MB prompt blob anyway.
 const FACET_VALUE_MAX_LEN = 512
+/** The attribute-key picker ranks keys over this many of the newest in-window traces. */
+const ATTRIBUTE_KEY_SAMPLE_TRACES = 500
 
 const TRACE_SUMMARY_SELECT_SQL = `
 	SELECT
@@ -1910,15 +1912,32 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 			return yield* Effect.sync(() => {
 				if (input.type === "logs") {
 					if (input.field === "service") {
-						const rows = db.query(`
+						// Checking the retention view reads every log row in the window. Count through
+						// the covering service/time index instead, then subtract the few rows that
+						// unfinished eviction hides.
+						const counts = new Map<string, number>()
+						const indexed = db.query(`
 							SELECT service_name AS value, COUNT(*) AS count
-							FROM ${logSource}
+							FROM logs INDEXED BY idx_logs_service_time
 							WHERE timestamp_ms >= ?
 							GROUP BY service_name
-							ORDER BY count DESC, value ASC
-							LIMIT ?
-						`).all(cutoff, limit) as Array<{ value: string; count: number }>
-						return rows
+						`).all(cutoff) as Array<{ value: string; count: number }>
+						for (const row of indexed) counts.set(row.value, row.count)
+						if (hasRetention) {
+							const hidden = db.query(`
+								SELECT service_name AS value, COUNT(*) AS count
+								FROM logs
+								WHERE timestamp_ms >= ?
+								  AND (trace_id IN (SELECT trace_id FROM retention_traces) OR id IN (SELECT id FROM retention_logs))
+								GROUP BY service_name
+							`).all(cutoff) as Array<{ value: string; count: number }>
+							for (const row of hidden) counts.set(row.value, (counts.get(row.value) ?? 0) - row.count)
+						}
+						return [...counts]
+							.filter(([, count]) => count > 0)
+							.map(([value, count]) => ({ value, count }))
+							.sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0))
+							.slice(0, limit)
 					}
 					if (input.field === "severity") {
 						const rows = db.query(`
@@ -1999,15 +2018,16 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 						// pre-filter trace_ids through trace_summaries (an indexed lookup) so
 						// the planner can use a SEMI JOIN against the small in-window set
 						// instead of joining every span_attributes row to trace_summaries.
-						const params: Array<string | number> = []
-						let traceFilter: string
-						if (input.serviceName) {
-							traceFilter = `(SELECT trace_id FROM ${traceSource} WHERE started_at_ms >= ? AND service_name = ?)`
-							params.push(cutoff, input.serviceName)
-						} else {
-							traceFilter = `(SELECT trace_id FROM ${traceSource} WHERE started_at_ms >= ?)`
-							params.push(cutoff)
-						}
+						// The set is the newest ATTRIBUTE_KEY_SAMPLE_TRACES traces: ranking over
+						// every in-window trace aggregated millions of rows on multi-GB stores.
+						const params: Array<string | number> = [cutoff]
+						if (input.serviceName) params.push(input.serviceName)
+						const traceFilter = `(
+							SELECT trace_id FROM ${traceSource}
+							WHERE started_at_ms >= ? ${input.serviceName ? "AND service_name = ?" : ""}
+							ORDER BY started_at_ms DESC, trace_id DESC
+							LIMIT ${ATTRIBUTE_KEY_SAMPLE_TRACES}
+						)`
 						params.push(FACET_VALUE_MAX_LEN, limit)
 						const rows = db.query(`
 							SELECT key AS value,
