@@ -347,3 +347,42 @@ test("size eviction takes the oldest telemetry first across traces and logs", ()
 		expect(count(db, "logs")).toBe(0)
 	} finally { db.close() }
 })
+
+test("interleaved trace and log ages stay ordered across partial size passes", () => {
+	const db = new Database(":memory:")
+	try {
+		schema(db)
+		db.transaction(() => {
+			for (let index = 0; index < 20; index++) {
+				const trace = `t${index}`
+				const at = 1000 + index * 20
+				db.query("INSERT INTO trace_summaries VALUES (?, ?, ?, 0)").run(trace, at, at + 1)
+				for (let span = 0; span < 8; span++) db.query("INSERT INTO spans(trace_id, span_id, start_time_ms, end_time_ms) VALUES (?, ?, ?, ?)").run(trace, String(span), at, at + 1)
+				db.query("INSERT INTO logs VALUES (?, NULL, ?, 'INFO')").run(index + 1, at + 10)
+			}
+		})()
+		const traceStart = new Map((db.query("SELECT trace_id, started_at_ms FROM trace_summaries").all() as { trace_id: string; started_at_ms: number }[]).map(row => [row.trace_id, row.started_at_ms]))
+		const logAt = new Map((db.query("SELECT id, timestamp_ms FROM logs").all() as { id: number; timestamp_ms: number }[]).map(row => [row.id, row.timestamp_ms]))
+		const sized = { ...options, cutoff: 0, maxBytes: 0, traces: 2, logs: 2, rows: 6 }
+		let passes = 0
+		let survivedPass = false
+		while ((count(db, "trace_summaries") > 0 || count(db, "logs") > 0) && passes++ < 500) {
+			const before = new Set((db.query("SELECT trace_id FROM retention_traces").all() as { trace_id: string }[]).map(row => row.trace_id))
+			retainBatch(db, sized)
+			const marked = (db.query("SELECT trace_id FROM retention_traces").all() as { trace_id: string }[]).map(row => row.trace_id)
+			if (marked.some(trace => before.has(trace))) survivedPass = true
+			const visibleTraces = new Set((db.query("SELECT trace_id FROM retained_trace_summaries").all() as { trace_id: string }[]).map(row => row.trace_id))
+			const visibleLogs = new Set((db.query("SELECT id FROM retained_logs").all() as { id: number }[]).map(row => row.id))
+			const hiddenLogMax = Math.max(-Infinity, ...[...logAt].filter(([id]) => !visibleLogs.has(id)).map(([, at]) => at))
+			const hiddenTraceMax = Math.max(-Infinity, ...[...traceStart].filter(([id]) => !visibleTraces.has(id)).map(([, at]) => at))
+			const visibleTraceMin = Math.min(Infinity, ...[...traceStart].filter(([id]) => visibleTraces.has(id)).map(([, at]) => at))
+			const visibleLogMin = Math.min(Infinity, ...[...logAt].filter(([id]) => visibleLogs.has(id)).map(([, at]) => at))
+			// Nothing is hidden while older telemetry of the other kind is still visible.
+			expect(hiddenLogMax).toBeLessThanOrEqual(visibleTraceMin)
+			expect(hiddenTraceMax).toBeLessThanOrEqual(visibleLogMin)
+		}
+		expect(passes).toBeLessThan(500)
+		expect(survivedPass).toBe(true)
+		expect(count(db, "spans") + count(db, "logs")).toBe(0)
+	} finally { db.close() }
+})
