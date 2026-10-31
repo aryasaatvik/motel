@@ -1,3 +1,13 @@
+## @aryasaatvik/motel@0.5.7
+
+### Keep facet queries inside the query deadline on large stores
+
+The log service facet now counts through an index instead of reading every log in the lookback window. The attribute-key picker ranks keys over the newest 500 traces in the window instead of every trace. On a 4 GB store these took 5 s and 10–43 s; they now take tens of milliseconds and no longer hold up searches queued behind them.
+
+### Keep the query process warm when a client gives up
+
+A client that disconnects or times out no longer kills Motel's readonly query process. The query finishes within its deadline, and the next request reuses the warm process. Before, a client with a short timeout could start a cascade in which every following search paid a cold restart and timed out in turn. Only a query that overruns `MOTEL_OTEL_QUERY_DEADLINE_MS` still restarts the process.
+
 ## @aryasaatvik/motel@0.5.6
 
 ### Keep service discovery fast on large stores
