@@ -1,10 +1,14 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep service discovery fast on large stores\n\nListing services now reads one index entry per service instead of every span and log in the lookback window. On multi-GB stores, `/api/services` and the TUI's auto-refresh no longer exceed the query deadline or hold up trace, log, and span searches queued behind them.\n"
-    filename: list-services-skip-scan.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep facet queries inside the query deadline on large stores\n\nThe log service facet now counts through an index instead of reading every log in the lookback window. The attribute-key picker ranks keys over the newest 500 traces in the window instead of every trace. On a 4 GB store these took 5 s and 10–43 s; they now take tens of milliseconds and no longer hold up searches queued behind them.\n"
+    filename: bounded-facets.md
+    v: 0.0.0
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep the query process warm when a client gives up\n\nA client that disconnects or times out no longer kills Motel's readonly query process. The query finishes within its deadline, and the next request reuses the warm process. Before, a client with a short timeout could start a cascade in which every following search paid a cold restart and timed out in turn. Only a query that overruns `MOTEL_OTEL_QUERY_DEADLINE_MS` still restarts the process.\n"
+    filename: query-warm-on-abort.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - list-services-skip-scan.md
+      - bounded-facets.md
+      - query-warm-on-abort.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
