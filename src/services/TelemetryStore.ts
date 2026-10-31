@@ -407,6 +407,47 @@ const toFtsMatchQuery = (value: string) => {
 	return tokens.map((token) => `${token}*`).join(" AND ")
 }
 
+/**
+ * Lists services with span or log activity at or after the cutoff (both `?` parameters).
+ * Activity comes from span rows, not trace starts: a long-running trace can emit a current
+ * child after its root ages outside the lookback window. Distinct names come from an index
+ * skip-scan and each name stops at its first recent retained row, so the cost tracks the
+ * service count rather than the rows inside the lookback window. `INDEXED BY` keeps that
+ * shape when planner statistics were gathered while the tables were small; it cannot name a
+ * view, so the probes repeat the `retained_spans` / `retained_logs` filters.
+ */
+export const listServicesSql = (hasRetention: boolean) => {
+	const retainedSpan = hasRetention ? "AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = s.trace_id)" : ""
+	const retainedLog = hasRetention
+		? "AND NOT EXISTS (SELECT 1 FROM retention_traces d WHERE d.trace_id = l.trace_id) AND NOT EXISTS (SELECT 1 FROM retention_logs d WHERE d.id = l.id)"
+		: ""
+	return `
+	WITH RECURSIVE
+		span_services(name) AS (
+			SELECT (SELECT MIN(service_name) FROM spans)
+			UNION ALL
+			SELECT (SELECT MIN(service_name) FROM spans WHERE service_name > span_services.name) FROM span_services WHERE name IS NOT NULL
+		),
+		log_services(name) AS (
+			SELECT (SELECT MIN(service_name) FROM logs)
+			UNION ALL
+			SELECT (SELECT MIN(service_name) FROM logs WHERE service_name > log_services.name) FROM log_services WHERE name IS NOT NULL
+		)
+	SELECT name AS service_name FROM span_services
+	WHERE name IS NOT NULL AND EXISTS (
+		SELECT 1 FROM spans s INDEXED BY idx_spans_service_time
+		WHERE s.service_name = span_services.name AND s.start_time_ms >= ? ${retainedSpan}
+	)
+	UNION
+	SELECT name AS service_name FROM log_services
+	WHERE name IS NOT NULL AND EXISTS (
+		SELECT 1 FROM logs l INDEXED BY idx_logs_service_time
+		WHERE l.service_name = log_services.name AND l.timestamp_ms >= ? ${retainedLog}
+	)
+	ORDER BY service_name ASC
+`
+}
+
 const buildExactAttributeMatchSubquery = (
 	tableName: "span_attributes" | "log_attributes",
 	idColumns: readonly string[],
@@ -1201,15 +1242,7 @@ const makeTelemetryStoreEffect = (opts: TelemetryStoreOptions) =>
 		const listServices = Effect.fn("motel/TelemetryStore.listServices")(function* () {
 			const cutoff = (yield* Clock.currentTimeMillis) - config.otel.traceLookbackMinutes * 60 * 1000
 			const services = yield* Effect.sync(() => {
-				// Discover recent activity from span rows, not trace starts: a
-				// long-running trace can emit a current child after its root ages
-				// outside the lookback window.
-				const rows = db.query(`
-					SELECT service_name FROM ${spanSource} WHERE start_time_ms >= ?
-					UNION
-					SELECT service_name FROM ${logSource} WHERE timestamp_ms >= ?
-					ORDER BY service_name ASC
-				`).all(cutoff, cutoff) as Array<{ service_name: string }>
+				const rows = db.query(listServicesSql(hasRetention)).all(cutoff, cutoff) as Array<{ service_name: string }>
 				return rows.map((row) => row.service_name)
 			})
 			yield* Effect.annotateCurrentSpan("trace.service_count", services.length)
