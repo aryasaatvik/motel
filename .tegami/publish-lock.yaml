@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep retention settings in the LaunchAgent\n\n`motel service install` now writes retention settings such as `MOTEL_OTEL_MAX_DB_SIZE_MB` and `MOTEL_OTEL_RETENTION_HOURS` from the install environment into the LaunchAgent, and keeps installed values when replacing the service. `motel service status` reports a requested retention value that differs from the installed one.\n"
-    filename: launchagent-retention-env.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Evict the oldest telemetry first when the database is over its size cap\n\nWhen the database exceeds `MOTEL_OTEL_MAX_DB_SIZE_MB`, Motel now removes traces and logs in age order. Before, every log became eligible at once, so fresh logs disappeared within milliseconds while older spans kept the database full.\n"
+    filename: size-eviction-oldest-first.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - launchagent-retention-env.md
+      - size-eviction-oldest-first.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
