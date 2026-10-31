@@ -1421,4 +1421,58 @@ describe("motel telemetry store", () => {
 			probe.close()
 		}
 	})
+
+	it("counts log services through the index without rows hidden by eviction", async () => {
+		const now = BigInt(Date.now()) * 1_000_000n
+		const logs = (traceId: string, bodies: readonly string[]) => ({
+			resourceLogs: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "facet-logs" } }] },
+				scopeLogs: [{ logRecords: bodies.map((body) => ({ traceId, timeUnixNano: String(now), body: { stringValue: body } })) }],
+			}],
+		})
+		const facet = await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			yield* store.ingestLogs(logs("facet-visible", ["kept-one", "kept-two", "evicting-log"]))
+			yield* store.ingestLogs(logs("facet-evicting-trace", ["evicting-trace-log"]))
+			const probe = new Database(dbPath)
+			const { id } = probe.query("SELECT id FROM logs WHERE body = 'evicting-log'").get() as { id: number }
+			try {
+				probe.query("INSERT INTO retention_logs VALUES (?)").run(id)
+				probe.query("INSERT INTO retention_traces VALUES (?)").run("facet-evicting-trace")
+				return yield* store.listFacets({ type: "logs", field: "service", limit: 100 })
+			} finally {
+				probe.query("DELETE FROM retention_logs WHERE id = ?").run(id)
+				probe.query("DELETE FROM retention_traces WHERE trace_id = 'facet-evicting-trace'").run()
+				probe.close()
+			}
+		}).pipe(Effect.provideService(References.MinimumLogLevel, "None")))
+
+		expect(facet).toContainEqual({ value: "facet-logs", count: 2 })
+		expect(facet).toEqual([...facet].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0)))
+	})
+
+	it("ranks attribute keys over the newest 500 traces in the window", async () => {
+		const nowNanos = BigInt(Date.now()) * 1_000_000n
+		const span = (index: number, key: string) => ({
+			traceId: `facet-sample-${index}`,
+			spanId: `facet-sample-span-${index}`,
+			name: "facet.sample",
+			startTimeUnixNano: String(nowNanos - BigInt(1_000 - index) * 1_000_000n),
+			endTimeUnixNano: String(nowNanos - BigInt(1_000 - index) * 1_000_000n + 1_000n),
+			attributes: [{ key, value: { stringValue: `value-${index}` } }],
+		})
+		const keys = await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			yield* store.ingestTraces({
+				resourceSpans: [{
+					resource: { attributes: [{ key: "service.name", value: { stringValue: "facet-sample" } }] },
+					scopeSpans: [{ spans: [span(0, "sample.oldest_only"), ...Array.from({ length: 500 }, (_, index) => span(index + 1, "sample.recent"))] }],
+				}],
+			})
+			return yield* store.listFacets({ type: "traces", field: "attribute_keys", serviceName: "facet-sample", limit: 100 })
+		}).pipe(Effect.provideService(References.MinimumLogLevel, "None")))
+
+		expect(keys).toContainEqual({ value: "sample.recent", count: 500 })
+		expect(keys.map((key) => key.value)).not.toContain("sample.oldest_only")
+	})
 })
