@@ -97,6 +97,32 @@ test("a caller abort leaves the query process warm for the next query", async ()
 	} finally { await f.close() }
 }, 5000)
 
+test("a request aborted while the process starts is never dispatched, and the process stays warm", async () => {
+	const root = mkdtempSync(join(tmpdir(), "motel-query-startup-"))
+	const events = join(root, "events")
+	writeFileSync(events, "")
+	const worker = join(root, "slow start.ts")
+	writeFileSync(worker, `
+import { appendFileSync } from "node:fs"
+process.on("message", request => {
+ appendFileSync(${JSON.stringify(events)}, request.method + "\\n")
+ process.send({_tag:"result", id:request.id, value:process.pid})
+})
+setTimeout(() => process.send({_tag:"ready"}), 300)
+`)
+	const scheduler = new QueryScheduler({ workerUrl: pathToFileURL(worker), capacity: 2, deadlineMs: 2000 })
+	try {
+		const caller = new AbortController()
+		const abandoned = scheduler.query("abandoned", [], caller.signal).catch((error) => error)
+		await sleep(50)
+		caller.abort()
+		expect(await abandoned).toBeInstanceOf(QueryUnavailable)
+		const first = await scheduler.query("pid", [], new AbortController().signal)
+		expect(await scheduler.query("pid", [], new AbortController().signal)).toBe(first)
+		expect(readFileSync(events, "utf8")).toBe("pid\npid\n")
+	} finally { await scheduler.close(); rmSync(root, { recursive: true, force: true }) }
+}, 5000)
+
 test("expired queued requests are removed before a replacement process can dispatch them", async () => {
 	const f = fixture(4, 400)
 	try {
