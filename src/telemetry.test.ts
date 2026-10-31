@@ -14,13 +14,14 @@ describe("motel telemetry store", () => {
 	let storeRuntime: Awaited<typeof import("./runtime.ts")>["storeRuntime"]
 	let TelemetryStore: Awaited<typeof import("./services/TelemetryStore.ts")>["TelemetryStore"]
 	let motelOpenApiSpec: Awaited<typeof import("./httpApi.ts")>["motelOpenApiSpec"]
+	let listServicesSql: Awaited<typeof import("./services/TelemetryStore.ts")>["listServicesSql"]
 
 	beforeAll(async () => {
 		process.env.MOTEL_OTEL_DB_PATH = dbPath
 		process.env.MOTEL_OTEL_RETENTION_HOURS = "24"
 		const suffix = `?test=${Date.now()}`
 		;({ storeRuntime } = await import(`./runtime.ts${suffix}`))
-		;({ TelemetryStore } = await import(`./services/TelemetryStore.ts${suffix}`))
+		;({ TelemetryStore, listServicesSql } = await import(`./services/TelemetryStore.ts${suffix}`))
 		;({ motelOpenApiSpec } = await import(`./httpApi.ts${suffix}`))
 
 		const nowNanos = BigInt(Date.now()) * 1_000_000n
@@ -1381,5 +1382,43 @@ describe("motel telemetry store", () => {
 		)
 
 		expect(services).toContain("active-child-only")
+	})
+
+	it("lists services by recent span or log activity", async () => {
+		const nowNanos = BigInt(Date.now()) * 1_000_000n
+		const staleNanos = nowNanos - 30n * 60n * 60n * 1_000_000_000n
+		const services = await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			yield* store.ingestTraces({
+				resourceSpans: [{
+					resource: { attributes: [{ key: "service.name", value: { stringValue: "stale-only" } }] },
+					scopeSpans: [{ spans: [{ traceId: "trace-stale-only", spanId: "stale-span", name: "stale.root", startTimeUnixNano: String(staleNanos), endTimeUnixNano: String(staleNanos + 1_000_000n) }] }],
+				}],
+			})
+			yield* store.ingestLogs({
+				resourceLogs: [{
+					resource: { attributes: [{ key: "service.name", value: { stringValue: "logs-only" } }] },
+					scopeLogs: [{ logRecords: [{ timeUnixNano: String(nowNanos), body: { stringValue: "logs-only activity" } }] }],
+				}],
+			})
+			return yield* store.listServices
+		}).pipe(Effect.provideService(References.MinimumLogLevel, "None")))
+
+		expect(services).toContain("logs-only")
+		expect(services).not.toContain("stale-only")
+		expect(services).toEqual([...services].sort())
+	})
+
+	it("lists services through index seeks instead of scanning the lookback window", () => {
+		const probe = new Database(dbPath, { readonly: true })
+		try {
+			const plan = probe.query(`EXPLAIN QUERY PLAN ${listServicesSql(true)}`).all(0, 0) as Array<{ detail: string }>
+			const details = plan.map((row) => row.detail)
+			expect(details.filter((detail) => /^SCAN (spans|logs|s|l)\b/.test(detail))).toEqual([])
+			expect(details.some((detail) => detail.includes("USING INDEX idx_spans_service_time (service_name=? AND start_time_ms>?)"))).toBe(true)
+			expect(details.some((detail) => detail.includes("USING INDEX idx_logs_service_time (service_name=? AND timestamp_ms>?)"))).toBe(true)
+		} finally {
+			probe.close()
+		}
 	})
 })
