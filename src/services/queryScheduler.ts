@@ -10,6 +10,8 @@ type Pending = {
 	timer?: ReturnType<typeof setTimeout>
 	onAbort?: () => void
 	cancelled?: Error
+	/** The caller stopped waiting; the dispatched query still runs to completion or its deadline. */
+	abandoned?: boolean
 	generation?: QueryProcess
 }
 
@@ -74,7 +76,10 @@ class QueryProcess {
 	}
 }
 
-/** FIFO admission includes startup and queue time in each request's deadline. */
+/**
+ * FIFO admission includes startup and queue time in each request's deadline. Only a deadline
+ * overrun retires the process; a caller abort leaves it warm so the next query skips a cold start.
+ */
 export class QueryScheduler {
 	private readonly queued: Pending[] = []
 	private readonly outstanding = new Set<Pending>()
@@ -108,6 +113,13 @@ export class QueryScheduler {
 
 	private cancel(entry: Pending, error: Error) {
 		if (!this.outstanding.has(entry) || entry.cancelled) return
+		if (this.active === entry && !(error instanceof QueryDeadlineExceeded) && !this.closed) {
+			// The query keeps its admission slot and deadline; the caller is released now.
+			if (entry.abandoned) return
+			entry.abandoned = true
+			entry.reject(error)
+			return
+		}
 		entry.cancelled = error
 		if (this.active === entry) {
 			// Do not release admission or report a deadline until the OS has closed the
@@ -136,6 +148,7 @@ export class QueryScheduler {
 			entry.generation = generation
 			await generation.ready
 			if (entry.cancelled) throw entry.cancelled
+			if (entry.abandoned) return
 			const value = await generation.request(entry.request)
 			if (entry.cancelled) throw entry.cancelled
 			entry.resolve(value)
