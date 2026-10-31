@@ -1,3 +1,9 @@
+## @aryasaatvik/motel@0.5.6
+
+### Keep service discovery fast on large stores
+
+Listing services now reads one index entry per service instead of every span and log in the lookback window. On multi-GB stores, `/api/services` and the TUI's auto-refresh no longer exceed the query deadline or hold up trace, log, and span searches queued behind them.
+
 ## @aryasaatvik/motel@0.5.5
 
 ### Evict the oldest telemetry first when the database is over its size cap
