@@ -29,7 +29,8 @@ process.on("message", request => {
   appendFileSync(${JSON.stringify(events)}, "reader-held\\n")
   db.query("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n").get()
  }
- process.send({_tag:"result", id:request.id, value:db.query("SELECT count(*) AS n FROM t").get()})
+ if (request.method === "medium") { const end = Date.now() + 200; while (Date.now() < end) {} }
+ process.send({_tag:"result", id:request.id, value:request.method === "pid" ? process.pid : db.query("SELECT count(*) AS n FROM t").get()})
 })
 process.send({_tag:"ready"})
 `)
@@ -58,7 +59,7 @@ test("deadline stops executing SQLite, releases its reader, and allows the next 
 	} finally { await f.close() }
 }, 5000)
 
-test("cancelling queued work prevents dispatch without interrupting the current reader", async () => {
+test("cancelling queued work prevents dispatch; an aborted active query keeps its reader until its deadline", async () => {
 	const f = fixture()
 	try {
 		const active = new AbortController()
@@ -70,11 +71,29 @@ test("cancelling queued work prevents dispatch without interrupting the current 
 		expect(await obsolete).toBeInstanceOf(QueryUnavailable)
 		f.db.exec("INSERT INTO t VALUES(2)")
 		expect(checkpointPassive(f.db).deferred).toBe(true)
+		const aborted = Date.now()
 		active.abort()
 		expect(await slow).toBeInstanceOf(QueryUnavailable)
+		expect(Date.now() - aborted).toBeLessThan(100)
+		// The caller is released at once, but only the deadline retires the overrunning reader.
+		expect(checkpointPassive(f.db).deferred).toBe(true)
+		await sleep(900)
 		expect(checkpointPassive(f.db).deferred).toBe(false)
 		expect(await f.scheduler.query("short", [], new AbortController().signal)).toEqual({ n: 2 })
 		expect(f.events()).not.toContain("obsolete")
+	} finally { await f.close() }
+}, 5000)
+
+test("a caller abort leaves the query process warm for the next query", async () => {
+	const f = fixture(2, 2000)
+	try {
+		const pid = await f.scheduler.query("pid", [], new AbortController().signal)
+		const caller = new AbortController()
+		const medium = f.scheduler.query("medium", [], caller.signal).catch((error) => error)
+		await sleep(50)
+		caller.abort()
+		expect(await medium).toBeInstanceOf(QueryUnavailable)
+		expect(await f.scheduler.query("pid", [], new AbortController().signal)).toBe(pid)
 	} finally { await f.close() }
 }, 5000)
 
