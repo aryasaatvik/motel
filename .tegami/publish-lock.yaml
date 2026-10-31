@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Evict the oldest telemetry first when the database is over its size cap\n\nWhen the database exceeds `MOTEL_OTEL_MAX_DB_SIZE_MB`, Motel now removes traces and logs in age order. Before, every log became eligible at once, so fresh logs disappeared within milliseconds while older spans kept the database full.\n"
-    filename: size-eviction-oldest-first.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Keep service discovery fast on large stores\n\nListing services now reads one index entry per service instead of every span and log in the lookback window. On multi-GB stores, `/api/services` and the TUI's auto-refresh no longer exceed the query deadline or hold up trace, log, and span searches queued behind them.\n"
+    filename: list-services-skip-scan.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - size-eviction-oldest-first.md
+      - list-services-skip-scan.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:

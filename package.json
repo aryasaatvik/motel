@@ -1,6 +1,6 @@
 {
   "name": "@aryasaatvik/motel",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "A local OpenTelemetry ingest + TUI viewer for development, backed by SQLite.",
   "type": "module",
   "license": "MIT",
