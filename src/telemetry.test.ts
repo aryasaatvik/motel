@@ -1475,4 +1475,43 @@ describe("motel telemetry store", () => {
 		expect(keys).toContainEqual({ value: "sample.recent", count: 500 })
 		expect(keys.map((key) => key.value)).not.toContain("sample.oldest_only")
 	})
+
+	it("serves AI calls through the AI span index, and without it from a store that predates it", async () => {
+		const probe = new Database(dbPath, { readonly: true })
+		const legacyPath = join(tempDir, "ai-index-legacy.sqlite")
+		try {
+			expect(probe.query("SELECT sql FROM sqlite_master WHERE name = 'idx_spans_ai_time'").get()).toEqual({
+				sql: "CREATE INDEX idx_spans_ai_time ON spans(start_time_ms DESC) WHERE operation_name LIKE 'ai.%'",
+			})
+			probe.exec(`VACUUM INTO '${legacyPath}'`)
+		} finally {
+			probe.close()
+		}
+		const legacy = new Database(legacyPath)
+		try { legacy.exec("DROP INDEX idx_spans_ai_time") } finally { legacy.close() }
+
+		const expected = await storeRuntime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.searchAiCalls({})))
+		const reader = Bun.spawn({
+			cmd: [process.execPath, "-e", `const { Effect, Layer } = await import('effect'); const { BunServices } = await import('@effect/platform-bun'); const { TelemetryStoreQueryWorkerLive, TelemetryStoreReadonly } = await import('./src/services/TelemetryStore.ts'); const calls = await Effect.runPromise(Effect.scoped(Effect.flatMap(TelemetryStoreReadonly, (store) => store.searchAiCalls({}))).pipe(Effect.provide(Layer.provideMerge(TelemetryStoreQueryWorkerLive, BunServices.layer)))); console.log(JSON.stringify(calls.map((call) => call.spanId)))`],
+			cwd: process.cwd(),
+			env: { ...process.env, MOTEL_OTEL_DB_PATH: legacyPath },
+			stdout: "pipe",
+			stderr: "pipe",
+		})
+		const [exitCode, stdout] = await Promise.all([reader.exited, new Response(reader.stdout).text()])
+		expect(exitCode).toBe(0)
+		expect(expected.length).toBeGreaterThan(0)
+		expect(JSON.parse(stdout.trim().split("\n").at(-1)!)).toEqual(expected.map((call) => call.spanId))
+	})
+
+	it("scopes AI calls to one trace through the trace lookup", async () => {
+		const [all, unknown] = await storeRuntime.runPromise(Effect.gen(function*() {
+			const store = yield* TelemetryStore
+			return [yield* store.searchAiCalls({}), yield* store.searchAiCalls({ traceId: "no-such-ai-trace" })] as const
+		}))
+		const traceId = all[0]!.traceId
+		const scoped = await storeRuntime.runPromise(Effect.flatMap(TelemetryStore, (store) => store.searchAiCalls({ traceId })))
+		expect(scoped.map((call) => call.spanId)).toEqual(all.filter((call) => call.traceId === traceId).map((call) => call.spanId))
+		expect(unknown).toEqual([])
+	})
 })
