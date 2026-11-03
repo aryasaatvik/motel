@@ -1,3 +1,9 @@
+## @aryasaatvik/motel@0.5.9
+
+### Update to Effect 4.1.2
+
+Update Motel's runtime, OpenTelemetry integration, and web client to Effect 4.1.2.
+
 ## @aryasaatvik/motel@0.5.8
 
 ### Index AI spans for AI-call queries
