@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Index AI spans for AI-call queries\n\nAI-call search and stats now seek a partial index over `ai.*` spans instead of reading every span in the lookback window. On a 4 GB store with no AI traffic, `/api/ai/calls` took 6 s and could hold up searches queued behind it. The first start on this version builds the index once, which briefly holds the write lock while it reads span operation names.\n"
-    filename: ai-calls-index.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Update to Effect 4.1.2\n\nUpdate Motel's runtime, OpenTelemetry integration, and web client to Effect 4.1.2.\n"
+    filename: effect-4-1-2.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - ai-calls-index.md
+      - effect-4-1-2.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:
