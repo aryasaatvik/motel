@@ -1,10 +1,10 @@
 core:changelogs:
-  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Update to Effect 4.1.2\n\nUpdate Motel's runtime, OpenTelemetry integration, and web client to Effect 4.1.2.\n"
-    filename: effect-4-1-2.md
+  - content: "---\npackages:\n  \"@aryasaatvik/motel\":\n    type: patch\n---\n\n### Accept compatible Effect releases\n\nMotel now depends on Effect 4.1.2 or any later compatible 4.x release, so a project that installs\nMotel shares its Effect version instead of getting a second copy.\n"
+    filename: effect-caret-ranges.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - effect-4-1-2.md
+      - effect-caret-ranges.md
     id: npm:@aryasaatvik/motel
     updated: true
 npm:packages:

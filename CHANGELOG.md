@@ -1,3 +1,10 @@
+## @aryasaatvik/motel@0.5.10
+
+### Accept compatible Effect releases
+
+Motel now depends on Effect 4.1.2 or any later compatible 4.x release, so a project that installs
+Motel shares its Effect version instead of getting a second copy.
+
 ## @aryasaatvik/motel@0.5.9
 
 ### Update to Effect 4.1.2
