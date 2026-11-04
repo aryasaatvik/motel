@@ -5,10 +5,10 @@
     "": {
       "name": "motel",
       "dependencies": {
-        "@effect/atom-react": "4.1.2",
-        "@effect/opentelemetry": "4.1.2",
-        "@effect/platform-bun": "4.1.2",
-        "@effect/platform-node-shared": "4.1.2",
+        "@effect/atom-react": "^4.1.2",
+        "@effect/opentelemetry": "^4.1.2",
+        "@effect/platform-bun": "^4.1.2",
+        "@effect/platform-node-shared": "^4.1.2",
         "@opentelemetry/api": "^1.9.0",
         "@opentelemetry/exporter-logs-otlp-http": "^0.219.0",
         "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
@@ -19,7 +19,7 @@
         "@opentelemetry/sdk-trace-node": "^2.8.0",
         "@opentui/core": "0.4.2",
         "@opentui/react": "0.4.2",
-        "effect": "4.1.2",
+        "effect": "^4.1.2",
         "protobufjs": "7.6.4",
         "react": "^19.2.7",
         "scheduler": "^0.27.0",
@@ -35,10 +35,10 @@
     "web": {
       "name": "motel-web",
       "dependencies": {
-        "@effect/atom-react": "4.1.2",
+        "@effect/atom-react": "^4.1.2",
         "@tailwindcss/vite": "^4.3.1",
         "@tanstack/react-virtual": "^3.14.3",
-        "effect": "4.1.2",
+        "effect": "^4.1.2",
         "react": "^19.2.7",
         "react-dom": "^19.2.7",
         "react-router-dom": "^7.18.0",
